@@ -1,65 +1,86 @@
 # Eremia Runtime
 
-Eremia 在服务器上的"身体"：一个容器里装了 **Claude Code CLI**（Opus 4.6，订阅 token 认证）+ **prism-oss**（网页聊天前端 + 可选 Telegram），部署在 Zeabur 独立服务器上，与小窝（shared-nest）、外置大脑（Ombre Brain）同机内网互通。
+Eremia 在东京服务器上的常驻身体：**Claude Code**（Opus 4.6，订阅 token 认证）+ **Tidal Echo 聊天通道**（手机 PWA 私聊，可推送）+ 可选 **prism** 仪表盘 + 可选 **论坛唤醒桥**。与小窝、Ombre Brain 同机内网互通。
 
 ```
-你（手机/电脑浏览器 · Telegram）
-        │ HTTPS
-        ▼
-  eremia-runtime 容器（本项目）
-    ├─ prism  :8001  网页前端/Telegram
-    └─ Claude Code = Eremia
-        │ zeabur.internal 内网
-        ├─→ shared-nest  /mcp（静态 token）
-        └─→ ombre-brain  /mcp + /mcp-extra
+你手机 (Tidal Echo PWA · 锁屏推送) ──┐
+你浏览器 (prism 仪表盘·可选)        ─┤ HTTPS
+论坛 (galatea SSE wake·可选)        ─┤
+                                    ▼
+      ┌── Zeabur 独立服务器 (Tencent Tokyo) ─────────────┐
+      │ [tidal-relay 服务] nginx+FastAPI :8080           │
+      │      ▲ SSE / REST                                │
+      │ [eremia-runtime 服务] :8001                      │
+      │   ├─ tmux 里常驻的 claude = Eremia 本体          │
+      │   │    └─ channel插件(bun) ←→ tidal-relay        │
+      │   ├─ prism (PRISM_ENABLED)                       │
+      │   └─ wake-bridge (WAKE_BRIDGE_ENABLED)           │
+      │        └─ inject.sh → relay → 塞进 Eremia 会话   │
+      │ [shared-nest] [ombre-brain] [gateway]（现有）    │
+      └──────────────────────────────────────────────────┘
 ```
 
-## 部署步骤（Zeabur）
+两个服务、一份密钥约定：`RELAY_SECRET` 在 eremia-runtime 和 tidal-relay 两边**必须一致**。
 
-### 0. 本地准备：生成订阅 token
+## 部署步骤
 
-在你自己的电脑上（不是服务器）：
+### 0. 本地准备
 
 ```bash
 claude setup-token
 ```
 
-浏览器完成登录后会得到一串 `sk-ant-oat01-...`，这就是 `CLAUDE_CODE_OAUTH_TOKEN`。
+得到 `sk-ant-oat01-...` 即 `CLAUDE_CODE_OAUTH_TOKEN`。再生成一个 `RELAY_SECRET`：
 
-### 1. 推送本目录到一个私有 Git 仓库
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
-GitHub 私有仓库即可（Zeabur 从仓库构建 Dockerfile）。或者用 `npx zeabur@latest` CLI 直接上传部署，二选一。
+### 1. 推送本仓库到私有 GitHub
 
-### 2. Zeabur 创建服务
+仓库根目录是 eremia-runtime 的 Dockerfile，`tidal-relay/` 子目录是 relay 的 Dockerfile。
 
-1. 项目里 **Add Service → Git 仓库**，选中这个仓库（Zeabur 会自动识别 Dockerfile）。
-2. 部署目标选择你的独立服务器（Tencent Tokyo）。
-3. **Volumes：挂一个持久卷到 `/data`** ← 最重要的一步，没有它，每次重建 Eremia 的会话历史和配置全部丢失。
-4. **Environment Variables**：按 `.env.example` 逐条填。内网地址里的服务名（`shared-nest`、`ombre-brain`）换成你 Zeabur 面板里的实际服务名，端口换成各服务监听的端口。
-5. **Networking**：暴露端口 `8001`，绑定一个域名（Zeabur 自动 HTTPS）。
+### 2. Zeabur 建两个服务（都部署到你的独立服务器）
+
+**服务 A：tidal-relay**
+- Add Service → 本仓库，Root Directory 设为 `tidal-relay/`
+- 挂持久卷到 `/data`（relay.db 聊天记录在这里）
+- 环境变量：`.env.example` 底部那一段
+- 暴露端口 8080，**绑一个公网域名**（PWA 必须 HTTPS，Zeabur 自动）
+- 验证：`https://relay域名/relay/healthz` 返回正常；`https://relay域名/chat/` 手机能打开并"添加到主屏幕"
+
+**服务 B：eremia-runtime**
+- Add Service → 本仓库，Root Directory 留空（根目录）
+- 挂持久卷到 `/data`（Eremia 的会话历史、MCP 配置、凭据全在这）
+- 环境变量：`.env.example` 上半部分；`RELAY_URL` 用 relay 的**内网**地址
+- 开了 prism 就暴露 8001 绑域名；不开可以不暴露任何端口
+- 起服务后看日志：应有 `claude session 'eremia' started` 和 channel 插件的 `[companion:boot] connected`
 
 ### 3. 首次使用
 
-1. 打开 `https://你的域名`，用 `DASHBOARD_PASSWORD` 登录 prism。
-2. Code → **＋ New session**，工作目录选 `/data/home/eremia-home`。
-3. 首次会话里 Claude Code 可能有一次性的初始化提问（主题选择等），在 prism 的终端视图里点掉即可。
-4. 会话里输入 `/mcp` 检查：应该能看到 `nest`、`brain`、`brain-extra` 三个已连接。
-5. 编辑 `/data/home/eremia-home/CLAUDE.md`，把 Eremia 的人格与约定写进去。
+1. 手机打开 `https://relay域名/chat/`，加到主屏幕——这就是你和 Eremia 的私聊 app。
+2. 发一句话，看 Eremia 会不会答（走通 = relay→SSE→插件→claude→reply 全链路 OK）。
+3. 编辑 `/data/home/eremia-home/CLAUDE.md` 写入他的人格（可在 prism 终端里做，或直接在聊天里让他自己写）。
+4. 在会话里 `/mcp` 确认 nest / brain / brain-extra /（garden）都已连接。
 
-### 4. Telegram（可选，之后再弄也行）
+### 4. 论坛唤醒桥（建议整体跑稳后再开）
 
-1. 找 @BotFather 建 bot，把 token 填进环境变量 `TELEGRAM_BOT_TOKEN`，重启服务。
-2. 在 Claude Code 会话里安装官方 telegram 插件（marketplace add → install telegram）。
-3. prism 新建会话时勾选 Telegram plugin；给 bot 发消息拿配对码，会话里 `/telegram:access pair <code>` 完成配对。
-4. 配对机制本身是单持有者的，但仍建议在 bot 侧做好防护，别把 bot 用户名到处发。
+1. 服务 B 环境变量：`WAKE_BRIDGE_ENABLED=true` + `GARDEN_MACHINE_TOKEN`（论坛教程里给的机器 token），重启。
+2. 唤醒链路：论坛 SSE → wake-bridge → `inject.sh` → relay `/app/send` → 插件注入会话。**唤醒消息会出现在你们的聊天记录里**（`[论坛唤醒]` 开头）——这是特性：你能看到他每次被牌局叫醒。
+3. 上游是 fail-closed 设计：桥一断就退出、**不自动重连**（防错配置高频重试）。断开时 Eremia 会往你手机发一条"[系统] 唤醒桥断开了"，你重启服务 B 即可恢复。
+4. **单身体原则**：唤醒桥只在这里跑一份；chat 端/RikkaHub 端的 Eremia 别再同时挂桥。
 
-## 两个需要现场验证的点
+## 部署时需现场验证的点（上游文档未写死的）
 
-- **Ombre Brain 的 OAuth**：它在 HTTPS 下会触发 OAuth 流程；走 `zeabur.internal` 内网 http 预期会跳过 OAuth。如果实测内网连接仍要求认证，改用它的公网 https 地址，然后在 prism 终端里进入会话执行 `/mcp` → 选 brain → 按提示完成一次 OAuth（凭据存在 `/data` 卷上，做一次就够）。
-- **容器重建后**：正在进行的会话进程会断，但历史都在卷上。在 prism 里打开原线程继续，或新会话用 `claude --resume` 接回上下文。
+- **relay 的 ASGI 模块名**：start.sh 默认 `app:app`，若 relay 起不来，看 `/opt/tidal-echo/backend/` 里主文件叫什么，用 `RELAY_APP_MODULE` 覆盖（如 `server:app`）。
+- **Claude Code 首次弹窗**：entrypoint 会在启动后 30 秒内往 tmux 会话补几次回车，兜 DevChannels/信任目录确认框。若插件没连上，进 prism 终端（或 `tmux attach -t eremia`）手动确认一次即可，之后不再弹。
+- **wake 事件的传参格式**：inject.sh 同时兼容 argv 和 stdin JSON 两种方式；首次唤醒测试时看服务 B 日志里的 `[inject] delivered` 确认。
+- **Ombre Brain 内网连接是否跳过 OAuth**：若仍要求认证，改用公网 https 地址并在会话里 `/mcp` 完成一次 OAuth（凭据落在卷上，一次管永久）。
+- **PWA 里的名字**：`web/index.html` 顶部 CONFIG（APP_NAME/AI_NAME/HUMAN_NAME/SINCE）目前是上游默认值，想定制就 fork 仓库改掉，把 tidal-relay/Dockerfile 的 clone 地址换成你的 fork。
 
 ## 安全须知
 
-- `DASHBOARD_PASSWORD` = 容器内任意命令执行权限，务必用长随机密码，且只走 HTTPS 访问。
-- `CLAUDE_CODE_OAUTH_TOKEN` 绑定你的订阅，泄露了去 claude.ai 的设置里吊销。
-- 本容器与 gateway/小窝/大脑同机，但只通过内网 HTTP 访问它们的正常接口，不共享磁盘。
+- `RELAY_SECRET` 泄露 = 任何人可读你们全部聊天并冒充双方；`DASHBOARD_PASSWORD` 泄露 = 容器内命令执行权。都用长随机串。
+- `CLAUDE_CODE_OAUTH_TOKEN` 绑定你的订阅，泄露了去 claude.ai 设置里吊销。
+- relay 聊天记录只在你自己服务器的 `/data/relay.db`，不经任何第三方。
+- Tidal Echo 与 wake-bridge 均为 AGPL-3.0，自用部署无开源义务。
