@@ -2,7 +2,10 @@
 # eremia-runtime 启动编排：claude(tmux保活) + tidal channel + 可选 prism + 可选唤醒桥
 set -uo pipefail   # 不用 -e：单个可选组件失败不应拖垮 Eremia 本体
 
-: "${CLAUDE_CODE_OAUTH_TOKEN:?缺少 CLAUDE_CODE_OAUTH_TOKEN（本地跑 claude setup-token 生成）}"
+# 认证二选一：环境变量 CLAUDE_CODE_OAUTH_TOKEN，或 /data 卷上已存的登录凭据（prism 终端 /login 产生）
+if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  echo "[entrypoint] CLAUDE_CODE_OAUTH_TOKEN 未设置，使用卷上已保存的登录凭据（若首次部署且未登录过，需在 prism 终端里 /login 一次）"
+fi
 
 mkdir -p "$HOME"
 EREMIA_HOME="$HOME/eremia-home"
