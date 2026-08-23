@@ -129,6 +129,13 @@ body {
   backdrop-filter: blur(12px) saturate(1.08);
 }
 
+.topbar > .topbtn.sessions.session-title-left {
+  position: absolute;
+  left: calc(50% - clamp(82px, 9vw, 116px));
+  top: calc(env(safe-area-inset-top) + clamp(14px, 2.5vw, 36px));
+  z-index: 2;
+}
+
 .peerpill .name {
   letter-spacing: .035em;
   text-shadow: 0 1px 22px rgba(150, 178, 120, .16);
@@ -393,6 +400,18 @@ body {
 }
 
 @media (max-width: 540px) {
+  .wall {
+    background-size: auto 90%;
+    background-position: center top;
+    background-repeat: no-repeat;
+  }
+
+  .topbar > .topbtn.sessions.session-title-left {
+    top: calc(env(safe-area-inset-top) + 16px);
+    width: 32px;
+    height: 32px;
+  }
+
   .header-actions {
     gap: clamp(12px, 3.2vw, 20px);
   }

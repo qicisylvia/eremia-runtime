@@ -84,7 +84,7 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 - `tidal-relay/eremia-web/eremia.js`：只做表现层增强；聊天协议和 API 请求保持上游实现。
 - `tidal-relay/eremia-web/assets/*.b64`：鹿、狼、瓷与桧木意象的 PWA 图标和聊天背景。Docker 构建时由 `customize.py` 解码，不需要额外前端构建工具。
 - `tidal-relay/eremia-web/customize.py`：把名字、纪念日、页脚、manifest、图标和主题写入固定的上游前端。
-- Service Worker 缓存名目前是 `eremia-hinoki-v3`。每次改动前端静态文件，都要把 `customize.py` 里的这个版本号递增，否则安卓 PWA 可能继续显示旧版。
+- Service Worker 缓存名目前是 `eremia-hinoki-v4`。每次改动前端静态文件，都要把 `customize.py` 里的这个版本号递增，否则安卓 PWA 可能继续显示旧版。
 - 网页里的名字、备注与双方头像编辑均保留，数据存在当前浏览器的 `localStorage`；栖瓷的头像只在本机显示，不进入消息协议，换手机或清站点数据后需要重新设置。
 - API 窗口与 Desktop / API 切换入口均保留，可在后端 loop 接通后直接启用。不要让两个身体同时消费同一条消息，避免重复回复。
 

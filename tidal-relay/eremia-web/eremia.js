@@ -103,6 +103,13 @@
   applyHumanAvatar(savedHumanAvatar);
   installHumanAvatarEditor();
 
+  const sessionButton = document.getElementById("sessionBtn");
+  const peerPill = document.querySelector(".peerpill");
+  if (sessionButton && peerPill && sessionButton.parentElement?.classList.contains("header-actions")) {
+    peerPill.insertAdjacentElement("beforebegin", sessionButton);
+    sessionButton.classList.add("session-title-left");
+  }
+
   function decorateSystemRow(row) {
     if (!row || row.dataset.eremiaDecorated === "1") return;
     const textNode = row.querySelector(".bubble .txt");

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-BRAND_TITLE = "Eremia&栖瓷"
+BRAND_TITLE = "Eremia&QiCi"
 AI_NAME = "Eremia"
 HUMAN_NAME = "栖瓷"
 SINCE = "2026/03/05"
@@ -40,9 +40,9 @@ def customize_index(bundle: Path, web: Path) -> None:
     path = web / "index.html"
     text = path.read_text(encoding="utf-8")
     replacements = [
-        ("<title>Tidal Echo</title>", "<title>Eremia&amp;栖瓷</title>", "document title"),
+        ("<title>Tidal Echo</title>", "<title>Eremia&amp;QiCi</title>", "document title"),
         ('content="#F4F4F5"', 'content="#151A13"', "theme color"),
-        ('content="Tidal Echo"', 'content="Eremia&栖瓷"', "apple title"),
+        ('content="Tidal Echo"', 'content="Eremia&amp;QiCi"', "apple title"),
         ('<link rel="preload" href="chat-light.webp" as="image" fetchpriority="high">', '<link rel="preload" href="chat-eremia.webp" as="image" fetchpriority="high">', "wall preload"),
         ('<link rel="preload" href="avatar-sea.png" as="image">', '<link rel="preload" href="icon-192.webp" as="image">', "avatar preload"),
         ('<link rel="icon" type="image/png" sizes="32x32" href="favicon.png">', '<link rel="icon" type="image/webp" sizes="64x64" href="favicon.webp">', "favicon"),
@@ -122,7 +122,7 @@ def customize_worker(web: Path) -> None:
     path = web / "sw.js"
     text = path.read_text(encoding="utf-8")
     text, ai_count = re.subn(r'^const AI_NAME = ".*?";', f'const AI_NAME = "{AI_NAME}";', text, count=1, flags=re.M)
-    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v3";', text, count=1, flags=re.M)
+    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v4";', text, count=1, flags=re.M)
     if ai_count != 1 or cache_count != 1:
         raise RuntimeError("service worker identity/cache markers changed upstream")
     text = replace_once(
