@@ -10,6 +10,5 @@ python -m uvicorn "$MODULE" \
   --app-dir /opt/tidal-echo/backend \
   --host 127.0.0.1 --port 3011 &
 
-# 前端 CONFIG 定制（名字等）：直接改 /opt/tidal-echo/web/index.html 顶部，
-# 或 fork 仓库改好后把 Dockerfile 里的 clone 地址换成你的 fork。
+# 前端已在镜像构建时由仓库内 eremia-web 覆盖层完成定制。
 exec nginx -g 'daemon off;'

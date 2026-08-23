@@ -76,7 +76,17 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 - **Claude Code 首次弹窗**：entrypoint 会在启动后 30 秒内往 tmux 会话补几次回车，兜 DevChannels/信任目录确认框。若插件没连上，进 prism 终端（或 `tmux attach -t eremia`）手动确认一次即可，之后不再弹。
 - **wake 事件的传参格式**：inject.sh 同时兼容 argv 和 stdin JSON 两种方式；首次唤醒测试时看服务 B 日志里的 `[inject] delivered` 确认。
 - **Ombre Brain 内网连接是否跳过 OAuth**：若仍要求认证，改用公网 https 地址并在会话里 `/mcp` 完成一次 OAuth（凭据落在卷上，一次管永久）。
-- **PWA 里的名字**：`web/index.html` 顶部 CONFIG（APP_NAME/AI_NAME/HUMAN_NAME/SINCE）目前是上游默认值，想定制就 fork 仓库改掉，把 tidal-relay/Dockerfile 的 clone 地址换成你的 fork。
+- **PWA 前端版本**：`tidal-relay/Dockerfile` 用 `TIDAL_ECHO_REF` 固定上游 commit，再从 `tidal-relay/eremia-web/` 应用 Eremia 的主题、文案和图片；以后上游升级要先更新 commit，再在本地运行 `customize.py` 检查替换点。
+
+## Eremia PWA 装修
+
+- `tidal-relay/eremia-web/eremia.css`：苔光 / 桧夜主题、雾面玻璃、字体回退、系统与论坛唤醒消息样式。
+- `tidal-relay/eremia-web/eremia.js`：只做表现层增强；聊天协议和 API 请求保持上游实现。
+- `tidal-relay/eremia-web/assets/*.b64`：鹿、狼、瓷与桧木意象的 PWA 图标和聊天背景。Docker 构建时由 `customize.py` 解码，不需要额外前端构建工具。
+- `tidal-relay/eremia-web/customize.py`：把名字、纪念日、页脚、manifest、图标和主题写入固定的上游前端。
+- Service Worker 缓存名目前是 `eremia-hinoki-v3`。每次改动前端静态文件，都要把 `customize.py` 里的这个版本号递增，否则安卓 PWA 可能继续显示旧版。
+- 网页里的名字、备注与双方头像编辑均保留，数据存在当前浏览器的 `localStorage`；栖瓷的头像只在本机显示，不进入消息协议，换手机或清站点数据后需要重新设置。
+- API 窗口与 Desktop / API 切换入口均保留，可在后端 loop 接通后直接启用。不要让两个身体同时消费同一条消息，避免重复回复。
 
 ## 安全须知
 
