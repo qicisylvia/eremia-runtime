@@ -10,7 +10,7 @@ RUN git init /opt/tidal-echo \
     && git -C /opt/tidal-echo remote add origin https://github.com/anhe2021212-spec/Tidal_Echo \
     && git -C /opt/tidal-echo fetch --depth 1 origin "$TIDAL_ECHO_REF" \
     && git -C /opt/tidal-echo checkout --detach FETCH_HEAD \
-    && pip install --no-cache-dir -r /opt/tidal-echo/backend/requirements.txt
+    && pip install --no-cache-dir -r /opt/tidal-echo/backend/requirements.txt py-vapid
 
 # Eremia 的前端装修作为仓库内覆盖层进入镜像；上游固定到上面的 commit，避免构建漂移。
 COPY eremia-web/ /opt/eremia-web/

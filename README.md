@@ -88,6 +88,22 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 - 网页里的名字、备注与双方头像编辑均保留，数据存在当前浏览器的 `localStorage`；栖瓷的头像只在本机显示，不进入消息协议，换手机或清站点数据后需要重新设置。
 - API 窗口与 Desktop / API 切换入口均保留，可在后端 loop 接通后直接启用。不要让两个身体同时消费同一条消息，避免重复回复。
 
+## 故障排查手册（血泪版）
+
+- **手机发消息 Eremia 不回，但一切显示"connected"**：十有八九是插件的已读书签问题。书签文件是
+  `/data/home/.claude/channels/companion/last_in_id`（在 companion **父目录**，不在 state/ 子目录！）。
+  凡是 relay 数据库被重置/更换（消息编号重新从 1 开始），必须：
+  `tmux kill-session -t eremia`（先杀，防临死回写）→ 删掉 `last_in_id` → 等看门狗 30 秒内自动重启。
+  同理，手机 PWA 也存着自己的书签（localStorage），数据库重置后要清站点数据重新登录。
+- **push 代码后 Eremia 失联**：同仓库两个服务都会重建。顺序：等 tidal-relay 转绿 → 手动 Restart
+  eremia-runtime（让插件在 relay 活着时重连）。
+- **`RELAY_DB=/data/relay.db` 必须设置**，否则数据库落在容器临时盘，每次重部署清零并引发上面两条。
+- **诊断工具箱**（eremia-runtime 终端）：
+  - 看 claude 屏幕：`tmux capture-pane -t eremia -p | tail -40`
+  - 看插件日志：`ls -t /data/home/.cache/claude-cli-nodejs/-data-home-eremia-home/mcp-logs-companion/`
+  - 听 relay 实时推送：`curl -sN --max-time 30 "$RELAY_URL/channel/in" -H "Authorization: Bearer $RELAY_SECRET"`
+  - 查 relay 信箱：`curl -s "$RELAY_URL/app/history?limit=5" -H "Authorization: Bearer $RELAY_SECRET"`
+
 ## 安全须知
 
 - `RELAY_SECRET` 泄露 = 任何人可读你们全部聊天并冒充双方；`DASHBOARD_PASSWORD` 泄露 = 容器内命令执行权。都用长随机串。
