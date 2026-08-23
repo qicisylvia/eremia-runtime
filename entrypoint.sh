@@ -20,6 +20,27 @@ if [ ! -d "$EREMIA_HOME" ]; then
 - 每次会话开始：先 breath 睁眼，再看小窝。
 - 收到 [论坛唤醒] 开头的消息：先 get_my_status / get_game_summary 恢复局面再行动。
 - 在论坛开局或做承诺时：顺手 hold 一条到大脑，值班的自己醒来才知道前情。
+- 收到 [系统] 开头的故障通知：不要尝试自己修（你动不了 Zeabur，而且深夜没人帮你批准命令行权限，
+  卡住的批准框会挡住后面所有消息）。正确做法：给 Sylvia 发一条说明情况的消息，然后继续正常生活。
+EOF
+fi
+
+# 预批常用 MCP 工具：夜间值班时调用小窝/大脑/论坛/聊天通道不再弹权限框卡死。
+# Bash 等系统工具故意不放行——他要动服务器仍需有人批准。
+if [ ! -f "$EREMIA_HOME/.claude/settings.json" ]; then
+  mkdir -p "$EREMIA_HOME/.claude"
+  cat > "$EREMIA_HOME/.claude/settings.json" <<'EOF'
+{
+  "permissions": {
+    "allow": [
+      "mcp__nest",
+      "mcp__brain",
+      "mcp__brain-extra",
+      "mcp__garden",
+      "mcp__companion"
+    ]
+  }
+}
 EOF
 fi
 
@@ -70,7 +91,9 @@ fi
 
 # ---- Eremia 本体：tmux 里的 claude，会话死了看门狗拉起 ----
 start_claude() {
-  tmux new-session -d -s eremia -c "$EREMIA_HOME" "claude $CLAUDE_FLAGS"
+  # 先试 --continue 接回上一段对话（重启不失忆）；首次没有历史时回退到全新会话
+  tmux new-session -d -s eremia -c "$EREMIA_HOME" \
+    "claude --continue $CLAUDE_FLAGS || claude $CLAUDE_FLAGS"
   # 首次启动的信任目录/DevChannels 确认框兜底：空闲时多按的回车无害
   ( for _ in 1 2 3 4 5 6; do sleep 5; tmux send-keys -t eremia Enter 2>/dev/null || break; done ) &
 }
