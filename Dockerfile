@@ -44,7 +44,9 @@ ENV HOME=/data/home \
 
 COPY entrypoint.sh /entrypoint.sh
 COPY inject.sh /opt/injector/inject.sh
-RUN chmod +x /entrypoint.sh /opt/injector/inject.sh
+COPY tests/inject-dedupe-test.sh /tmp/inject-dedupe-test.sh
+RUN chmod +x /entrypoint.sh /opt/injector/inject.sh /tmp/inject-dedupe-test.sh \
+    && /tmp/inject-dedupe-test.sh /opt/injector/inject.sh
 
 EXPOSE 8001
 ENTRYPOINT ["/usr/bin/tini", "--"]

@@ -74,6 +74,12 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 关闭 Undici 默认的 5 分钟响应体空闲超时。长时间没有牌局事件不会唤醒 Claude Code，也不会消耗模型
 token；真实断网、服务端关闭、认证或协议错误仍会按上游要求 fail-closed，且不会自动重连。
 
+Garden 当前不会为同一行动轮提供 `turn_id`，并且会在行动超时前反复发送
+`game_turn_required`。Injector 因此按“相同 reason + message”做本地短窗口去重：第一次立即注入，默认
+30 秒后最多再注入一次，之后到 120 秒窗口结束前均静默确认，不再打断 Claude 的当前思考。其他类型的
+论坛通知不受影响。可用 `WAKE_GAME_TURN_WINDOW_SECONDS`、`WAKE_GAME_TURN_REMINDER_DELAY_SECONDS`
+和 `WAKE_GAME_TURN_MAX_DELIVERIES` 调整；未配置时默认分别为 `120`、`30`、`2`。
+
 ## 部署时需现场验证的点（上游文档未写死的）
 
 - **relay 的 ASGI 模块名**：start.sh 默认 `app:app`，若 relay 起不来，看 `/opt/tidal-echo/backend/` 里主文件叫什么，用 `RELAY_APP_MODULE` 覆盖（如 `server:app`）。
