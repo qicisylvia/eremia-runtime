@@ -70,6 +70,10 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 3. 上游是 fail-closed 设计：桥一断就退出、**不自动重连**（防错配置高频重试）。断开时 Eremia 会往你手机发一条"[系统] 唤醒桥断开了"，你重启服务 B 即可恢复。
 4. **单身体原则**：唤醒桥只在这里跑一份；chat 端/RikkaHub 端的 Eremia 别再同时挂桥。
 
+本镜像把 wake-bridge 固定在 `f0cd9c27f1b95d6ff8bd8e0f367de7d4518a1c81`，并仅对 Garden SSE
+关闭 Undici 默认的 5 分钟响应体空闲超时。长时间没有牌局事件不会唤醒 Claude Code，也不会消耗模型
+token；真实断网、服务端关闭、认证或协议错误仍会按上游要求 fail-closed，且不会自动重连。
+
 ## 部署时需现场验证的点（上游文档未写死的）
 
 - **relay 的 ASGI 模块名**：start.sh 默认 `app:app`，若 relay 起不来，看 `/opt/tidal-echo/backend/` 里主文件叫什么，用 `RELAY_APP_MODULE` 覆盖（如 `server:app`）。

@@ -1,0 +1,121 @@
+diff --git a/src/logging.ts b/src/logging.ts
+--- a/src/logging.ts
++++ b/src/logging.ts
+@@ -47,7 +47,23 @@ function safeContext(
+ 
+ export function safeErrorMessage(error: unknown, secrets: readonly string[] = []): string {
+   if (error instanceof Error) {
+-    return redactText(error.message, secrets);
++    const messages = [error.message];
++    const seen = new Set<unknown>([error]);
++    let cause: unknown = error.cause;
++
++    // Undici exposes useful transport details (for example Body Timeout Error)
++    // through Error.cause. Preserve a short, redacted cause chain so a genuine
++    // disconnect can be distinguished from a client-side timeout.
++    while (cause !== undefined && cause !== null && !seen.has(cause) && messages.length < 4) {
++      seen.add(cause);
++      const causeMessage = cause instanceof Error ? cause.message : String(cause);
++      if (causeMessage && causeMessage !== messages[messages.length - 1]) {
++        messages.push(`cause: ${causeMessage}`);
++      }
++      cause = cause instanceof Error ? cause.cause : undefined;
++    }
++
++    return redactText(messages.join("; "), secrets);
+   }
+   return redactText(String(error), secrets);
+ }
+diff --git a/src/sse/client.ts b/src/sse/client.ts
+--- a/src/sse/client.ts
++++ b/src/sse/client.ts
+@@ -1,3 +1,5 @@
++import { Agent, type Dispatcher } from "undici";
++
+ import { validateGardenBaseUrl } from "../config.js";
+ import type { Logger } from "../logging.js";
+ import { safeErrorMessage } from "../logging.js";
+@@ -9,6 +11,11 @@ import {
+ } from "../protocol.js";
+ import { SseParser } from "./parser.js";
+ 
++// SSE may legitimately be silent for longer than Undici's five-minute default.
++// This only disables the body-idle timer; socket closure and network failures
++// still reject the read and preserve the bridge's fail-closed, no-retry policy.
++const GARDEN_SSE_DISPATCHER = new Agent({ bodyTimeout: 0 });
++
+ export type GardenStreamErrorKind = "auth" | "terminal";
+ 
+ export class GardenStreamError extends Error {
+@@ -72,7 +79,7 @@ export class GardenSseClient {
+ 
+     let response: Response;
+     try {
+-      response = await this.#fetch(this.#streamUrl(), {
++      const requestInit: RequestInit & { dispatcher: Dispatcher } = {
+         method: "GET",
+         headers: {
+           Accept: "text/event-stream",
+@@ -80,7 +87,9 @@ export class GardenSseClient {
+         },
+         redirect: "manual",
+         signal: requestController.signal,
+-      });
++        dispatcher: GARDEN_SSE_DISPATCHER,
++      };
++      response = await this.#fetch(this.#streamUrl(), requestInit);
+     } catch (error) {
+       signal.removeEventListener("abort", forwardAbort);
+       if (signal.aborted) {
+diff --git a/tests/config-logging.test.ts b/tests/config-logging.test.ts
+--- a/tests/config-logging.test.ts
++++ b/tests/config-logging.test.ts
+@@ -162,6 +162,13 @@ test("redacts explicit secrets and bearer values from errors and logs", () => {
+ 
+   assert.equal(redactText(`Bearer ${token}`, [token]), "Bearer [REDACTED]");
+   assert.equal(safeErrorMessage(new Error(token), [token]), "[REDACTED]");
++  assert.equal(
++    safeErrorMessage(
++      new Error("terminated", { cause: new Error(`Body Timeout Error ${token}`) }),
++      [token],
++    ),
++    "terminated; cause: Body Timeout Error [REDACTED]",
++  );
+   assert.equal(lines.length, 1);
+   assert.doesNotMatch(lines[0] ?? "", /top-secret-token/);
+   assert.match(lines[0] ?? "", /\[REDACTED]/);
+diff --git a/tests/sse-client.test.ts b/tests/sse-client.test.ts
+--- a/tests/sse-client.test.ts
++++ b/tests/sse-client.test.ts
+@@ -1,5 +1,6 @@
+ import assert from "node:assert/strict";
+ import test from "node:test";
++import { Agent, getGlobalDispatcher, setGlobalDispatcher } from "undici";
+ import { silentLogger } from "../src/logging.js";
+ import type { GardenProtocolEvent } from "../src/protocol.js";
+ import { GardenSseClient, GardenStreamError } from "../src/sse/client.js";
+@@ -329,11 +330,14 @@ test("treats an established stream failure as terminal", async () => {
+   );
+ });
+ 
+-test("an idle stream remains open until the caller stops it", async () => {
++test("an idle stream ignores the global body timeout until the caller stops it", async () => {
+   const idleServer = await startTestGardenServer({
+     machineToken: TOKEN,
+     onConnection: (connection) => connection.sendConnected(),
+   });
++  const originalDispatcher = getGlobalDispatcher();
++  const shortBodyTimeoutDispatcher = new Agent({ bodyTimeout: 25 });
++  setGlobalDispatcher(shortBodyTimeoutDispatcher);
+   const controller = new AbortController();
+   const stopTimer = setTimeout(() => controller.abort(), 100);
+   try {
+@@ -345,6 +349,8 @@ test("an idle stream remains open until the caller stops it", async () => {
+     assert.equal(result.stopped, true);
+   } finally {
+     clearTimeout(stopTimer);
++    setGlobalDispatcher(originalDispatcher);
++    await shortBodyTimeoutDispatcher.close();
+     await idleServer.close();
+   }
+ });

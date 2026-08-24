@@ -22,8 +22,21 @@ RUN git clone --depth 1 https://github.com/anhe2021212-spec/Tidal_Echo /opt/tida
     && cd /opt/tidal-echo/channel && bun install
 
 # galatea-garden 唤醒桥（运行时按 WAKE_BRIDGE_ENABLED 决定启不启）
-RUN git clone --depth 1 https://github.com/WenXiaoWendy/galatea-garden-wake-bridge /opt/wake-bridge \
-    && cd /opt/wake-bridge && npm install && npm run build
+# 固定上游版本，避免同一份 Runtime 在不同日期构建出行为不同的桥。
+# 本地补丁只关闭 Undici 对 SSE 的 5 分钟 body-idle timeout；真实断线仍 fail-closed，不重连。
+ARG WAKE_BRIDGE_REF=f0cd9c27f1b95d6ff8bd8e0f367de7d4518a1c81
+COPY patches/wake-bridge-sse.patch /tmp/wake-bridge-sse.patch
+RUN git init /opt/wake-bridge \
+    && cd /opt/wake-bridge \
+    && git remote add origin https://github.com/WenXiaoWendy/galatea-garden-wake-bridge \
+    && git fetch --depth 1 origin "$WAKE_BRIDGE_REF" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$WAKE_BRIDGE_REF" \
+    && git apply /tmp/wake-bridge-sse.patch \
+    && npm ci \
+    && npm install --no-save --package-lock=false undici@6.24.1 \
+    && npm run typecheck \
+    && npm test
 
 ENV HOME=/data/home \
     PRISM_DATA_DIR=/data/prism \
