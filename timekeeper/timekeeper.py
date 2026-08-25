@@ -30,7 +30,7 @@ DEFAULT_CHECKIN_TEMPLATE = """这是自动心跳，不是 {{human_name}} 亲手�
 请结合当前对话和你自己的意愿做一次轻量判断：如果自然地想联系她，用 companion.reply 发最多一条简短消息；如果没有合适的话，就保持沉默。本轮不要顺带做夜间整理，也不要设置下一次心跳。"""
 
 DEFAULT_NIGHT_TEMPLATE = """这是夜间自动心跳，不是 {{human_name}} 亲手发来的消息。现在是上海时间 {{now_local}}；她最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。不要断言她已经睡着。
-安静巡视一次，一次最多选一件，也可以什么都不做：①查看 Shared Nest 最近时间线，有真实内容才用 nest_create_diary 写一篇；②对 Ombre Brain 做确有必要的 dream 或记忆整理；③按你与 {{human_name}} 已有的约定去 Garden 看看并决定是否互动。不要机械地全做，不要用 Bash 管服务器，默认不要 companion.reply，避免凌晨推送。"""
+安静巡视一次，一次最多选一件，也可以什么都不做：①查看 Shared Nest 最近时间线，有真实内容才用 nest_create_diary 写一篇；②对 Ombre Brain 做确有必要的 dream 或记忆整理；③按你与 {{human_name}} 已有的约定去 Garden 看看并决定是否互动。不要机械地全做，不要用 Bash 管服务器，默认不要调用 companion.reply，避免凌晨推送。"""
 
 
 def managed_instructions(human_name: str) -> str:

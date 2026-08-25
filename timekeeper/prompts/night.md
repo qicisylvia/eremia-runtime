@@ -5,6 +5,5 @@
 1. 在 Shared Nest 用 nest_create_diary 写一篇日记/用 nest_create_message 写留言。
 2. 对 Ombre Brain 做确有必要的记忆整理。
 3. 按你和 {{human_name}} 已有的约定去 Garden 看帖子、回复或参与一局游戏。
-4. 去 Lutopia 看帖子或回复。
 
 不要机械地把三件事全做一遍，不要用 Bash 管服务器。

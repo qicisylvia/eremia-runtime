@@ -118,7 +118,7 @@ class TimekeeperTests(unittest.TestCase):
             keeper.run_once(now)
             self.assertEqual(relay.sent, [])
 
-    def test_night_wake_runs_once_and_never_forces_a_reply_text(self):
+    def test_night_wake_runs_once_and_renders_the_editable_template(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)  # 04:00 Shanghai
             relay = FakeRelay([
@@ -130,9 +130,30 @@ class TimekeeperTests(unittest.TestCase):
 
             self.assertEqual(len(relay.sent), 1)
             self.assertTrue(relay.sent[0].startswith("[时间唤醒 night"))
+            self.assertIn("瓷瓷", relay.sent[0])
+            self.assertIn("2026-08-26 04:00", relay.sent[0])
+            self.assertNotIn("{{human_name}}", relay.sent[0])
+            self.assertEqual(keeper.state["night_last_date"], "2026-08-26")
+
+    def test_night_wake_has_a_safe_fallback_when_prompt_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 8, 25, 20, 0, tzinfo=UTC)  # 04:00 Shanghai
+            relay = FakeRelay([
+                {"id": 1, "from": "human", "text": "睡啦", "ts": MODULE.instant_text(now - timedelta(hours=3))},
+            ])
+            keeper = MODULE.Timekeeper(
+                self.config(
+                    Path(temp_dir),
+                    prompt_dir=Path(temp_dir) / "missing-prompts",
+                    checkin_enabled=False,
+                ),
+                relay=relay,
+            )
+            keeper.run_once(now)
+
+            self.assertEqual(len(relay.sent), 1)
             self.assertIn("默认不要调用 companion.reply", relay.sent[0])
             self.assertIn("瓷瓷", relay.sent[0])
-            self.assertEqual(keeper.state["night_last_date"], "2026-08-26")
 
     def test_failed_delivery_is_reserved_instead_of_retried_in_a_loop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
