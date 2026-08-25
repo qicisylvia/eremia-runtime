@@ -58,10 +58,11 @@ ENV HOME=/data/home \
 
 COPY entrypoint.sh /entrypoint.sh
 COPY inject.sh /opt/injector/inject.sh
+COPY hooks/ /opt/hooks/
 COPY timekeeper/ /opt/timekeeper/
 COPY tests/inject-dedupe-test.sh /tmp/inject-dedupe-test.sh
 COPY tests/timekeeper-test.py /tmp/timekeeper-test.py
-RUN chmod +x /entrypoint.sh /opt/injector/inject.sh /opt/timekeeper/timekeeper.py /tmp/inject-dedupe-test.sh
+RUN chmod +x /entrypoint.sh /opt/injector/inject.sh /opt/hooks/*.sh /opt/timekeeper/timekeeper.py /tmp/inject-dedupe-test.sh
 RUN echo "[build-test] wake injector dedupe" \
     && /tmp/inject-dedupe-test.sh /opt/injector/inject.sh
 RUN echo "[build-test] timekeeper" \

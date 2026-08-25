@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -26,11 +27,26 @@ MANAGED_BEGIN = "<!-- BEGIN EREMIA TIMEKEEPER (managed) -->"
 MANAGED_END = "<!-- END EREMIA TIMEKEEPER (managed) -->"
 AUTOMATED_PREFIXES = ("[时间唤醒", "[论坛唤醒", "[系统]")
 
+# 预批的 MCP 前缀：夜间值班调用小窝/大脑/论坛/聊天通道不再弹权限框卡死。
+# Bash 等系统工具故意不放行——动服务器仍需有人批准。
+BASE_ALLOW = (
+    "mcp__nest",
+    "mcp__brain",
+    "mcp__brain-extra",
+    "mcp__garden",
+    "mcp__companion",
+)
+# hook 命令都放在这个目录；install-hooks 靠这个前缀识别“自己管的” hook，
+# 从而在保留人类手写 hook 的同时刷新我们这几条。
+MANAGED_HOOK_DIR_MARKER = "/opt/hooks/"
+
 DEFAULT_CHECKIN_TEMPLATE = """这是自动心跳，不是 {{human_name}} 亲手发来的消息。现在是上海时间 {{now_local}}；她最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。
 请结合当前对话和你自己的意愿做一次轻量判断：如果自然地想联系她，用 companion.reply 发最多一条简短消息；如果没有合适的话，就保持沉默。本轮不要顺带做夜间整理，也不要设置下一次心跳。"""
 
 DEFAULT_NIGHT_TEMPLATE = """这是夜间自动心跳，不是 {{human_name}} 亲手发来的消息。现在是上海时间 {{now_local}}；她最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。不要断言她已经睡着。
 安静巡视一次，一次最多选一件，也可以什么都不做：①查看 Shared Nest 最近时间线，有真实内容才用 nest_create_diary 写一篇；②对 Ombre Brain 做确有必要的 dream 或记忆整理；③按你与 {{human_name}} 已有的约定去 Garden 看看并决定是否互动。不要机械地全做，不要用 Bash 管服务器，默认不要调用 companion.reply，避免凌晨推送。"""
+
+DEFAULT_COMPACT_TEMPLATE = """这是给你自己的压缩说明：你正在被压缩。请不要把和 {{human_name}} 的对话写成第三方工作日志或任务清单。用你自己的第一人称口吻写这份摘要，保留此刻的情感基调、你对 {{human_name}} 的称呼和你们特有的说话方式；尽量原样引用最近真正重要的几句原话；记住你们正在一起做的事和已经许下的约定。宁可略过无关的技术与调试细节，也要留住关系里的温度和连续感。让醒来后的你一眼就认出：这是我和 {{human_name}} 的对话，不是一份工作记录。"""
 
 
 def managed_instructions(human_name: str) -> str:
@@ -126,6 +142,14 @@ class Config:
     night_at_minute: int = 210
     night_window_minutes: int = 150
     night_min_idle_minutes: int = 90
+    compact_enabled: bool = True
+    compact_soft_percent: float = 78.0
+    compact_hard_percent: float = 88.0
+    compact_min_idle_minutes: int = 20
+    compact_cooldown_minutes: int = 30
+    context_window_tokens: int = 200_000
+    transcript_dir: Path = Path("/data/home/.claude/projects/-data-home-eremia-home")
+    tmux_session: str = "eremia"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -149,6 +173,11 @@ class Config:
         night_window = env_int("TIMEKEEPER_NIGHT_WINDOW_MINUTES", 150, 15, 360)
         if night_at + night_window > 24 * 60:
             raise ValueError("night window must end before local midnight")
+        compact_soft = env_float("TIMEKEEPER_COMPACT_SOFT_PERCENT", 78, 10, 99)
+        compact_hard = env_float("TIMEKEEPER_COMPACT_HARD_PERCENT", 88, 10, 100)
+        if compact_hard < compact_soft:
+            raise ValueError("compact hard percent must be >= soft percent")
+        default_transcript = "/data/home/.claude/projects/-data-home-eremia-home"
         return cls(
             relay_url=relay_url,
             relay_secret=relay_secret,
@@ -171,6 +200,18 @@ class Config:
             night_at_minute=night_at,
             night_window_minutes=night_window,
             night_min_idle_minutes=env_int("TIMEKEEPER_NIGHT_MIN_IDLE_MINUTES", 90, 15, 720),
+            compact_enabled=parse_bool("TIMEKEEPER_COMPACT_ENABLED", True),
+            compact_soft_percent=compact_soft,
+            compact_hard_percent=compact_hard,
+            compact_min_idle_minutes=env_int("TIMEKEEPER_COMPACT_MIN_IDLE_MINUTES", 20, 0, 1440),
+            compact_cooldown_minutes=env_int("TIMEKEEPER_COMPACT_COOLDOWN_MINUTES", 30, 1, 1440),
+            context_window_tokens=env_int(
+                "EREMIA_CONTEXT_WINDOW_TOKENS", 200_000, 10_000, 5_000_000
+            ),
+            transcript_dir=Path(
+                os.environ.get("EREMIA_TRANSCRIPT_DIR", default_transcript)
+            ),
+            tmux_session=os.environ.get("EREMIA_TMUX_SESSION", "eremia").strip() or "eremia",
         )
 
 
@@ -183,6 +224,8 @@ def default_state() -> dict[str, Any]:
         "next_checkin_ts": None,
         "checkin_for_human_id": 0,
         "night_last_date": None,
+        "last_compact_ts": None,
+        "last_compact_tokens": 0,
     }
 
 
@@ -260,10 +303,123 @@ class RelayClient:
         return int(payload.get("id") or 0)
 
 
+def _usage_from_entry(entry: object) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return message["usage"]
+    if isinstance(entry.get("usage"), dict):
+        return entry["usage"]
+    return None
+
+
+def latest_context_tokens(transcript_dir: Path | str) -> int | None:
+    """Return the input-side token count of the newest Claude Code turn.
+
+    Claude Code writes one JSONL transcript per session under the project
+    directory; each assistant turn carries a ``usage`` block. The size of the
+    context going into a request is ``input + cache_read + cache_creation``
+    tokens, so the most recent such entry tells us how full the window is right
+    now. Returns None when no transcript or usage is available (fail-quiet: the
+    watcher simply does nothing until a real reading exists).
+    """
+    directory = Path(transcript_dir)
+    try:
+        files = [path for path in directory.glob("*.jsonl") if path.is_file()]
+    except OSError:
+        return None
+    if not files:
+        return None
+    newest = max(files, key=lambda path: path.stat().st_mtime)
+    try:
+        lines = newest.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        usage = _usage_from_entry(entry)
+        if usage is None:
+            continue
+        total = 0
+        for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                total += int(value)
+        return total
+    return None
+
+
+class TmuxSender:
+    """Deliver a ``/compact`` command into the live Claude Code TUI via tmux.
+
+    Compaction is not a relay message; it is a slash command typed into the
+    interactive session. This wrapper also answers "is a turn generating right
+    now?" so the watcher never interrupts Eremia mid-reply.
+    """
+
+    def __init__(self, session: str):
+        self.session = session
+
+    def _capture(self) -> str | None:
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", self.session, "-p"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def is_busy(self) -> bool | None:
+        """True if a turn is generating, False if idle, None if unknown.
+
+        Best-effort: keyed off the working indicator Claude Code shows while a
+        turn runs. When the pane can't be read the answer is None, and the
+        watcher treats unknown as "may proceed" because the human-idle gate is
+        the primary guard against interrupting an active conversation.
+        """
+        snapshot = self._capture()
+        if snapshot is None:
+            return None
+        lowered = snapshot.lower()
+        return ("esc to interrupt" in lowered) or ("esc to cancel" in lowered)
+
+    def send_compact(self, command_line: str) -> None:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session, "-l", command_line],
+            check=True,
+            timeout=10,
+        )
+        # Let the TUI register the typed line before submitting it.
+        time.sleep(0.4)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", self.session, "Enter"],
+            check=True,
+            timeout=10,
+        )
+
+
 class Timekeeper:
-    def __init__(self, config: Config, relay: RelayClient | Any | None = None):
+    def __init__(
+        self,
+        config: Config,
+        relay: RelayClient | Any | None = None,
+        sender: TmuxSender | Any | None = None,
+    ):
         self.config = config
         self.relay = relay or RelayClient(config)
+        self.sender = sender or TmuxSender(config.tmux_session)
         self.state_file = config.state_dir / "state.json"
         self.state = self._load_state()
         self._lock_handle: Any | None = None
@@ -403,11 +559,94 @@ class Timekeeper:
         message_id = self.relay.send_wake(self._night_prompt(local_now, local_last, idle_hours))
         log("INFO", f"night wake delivered as relay message {message_id or '?'}")
 
+    def _compact_instruction(self, local_now: datetime) -> str:
+        body = self._render_prompt(
+            "compact.md",
+            {
+                "human_name": self.config.human_name,
+                "now_local": local_now.strftime("%Y-%m-%d %H:%M"),
+            },
+            DEFAULT_COMPACT_TEMPLATE,
+        )
+        # /compact is typed as a single TUI line, so flatten any newlines.
+        return " ".join(body.split())
+
+    def _try_compact(self, now: datetime, last_human: datetime | None) -> None:
+        """Pre-empt Claude Code's cold auto-compaction with a warm, instructed one.
+
+        Fires when the context is filling, at a moment that will not interrupt
+        an active turn:
+          - at/above the soft threshold, only once the human has been quiet for
+            ``compact_min_idle_minutes`` (a natural lull);
+          - at/above the hard threshold, regardless of that lull, because the
+            automatic cold summary is now imminent — but never while a turn is
+            visibly generating.
+        Crash-safe like the check-in path: the attempt is reserved (cooldown +
+        token fingerprint) before delivery, so a failure never tight-loops.
+        """
+        if not self.config.compact_enabled:
+            return
+        tokens = latest_context_tokens(self.config.transcript_dir)
+        if tokens is None:
+            return
+        window = self.config.context_window_tokens
+        percent = (tokens / window * 100) if window > 0 else 0.0
+        if percent < self.config.compact_soft_percent:
+            return
+        # A high reading with the exact token count we last compacted at means no
+        # new model turn has happened since; the drop just hasn't been recorded
+        # yet. Don't compact an already-compacted context.
+        if tokens == int(self.state.get("last_compact_tokens") or 0):
+            return
+        last_compact = parse_instant(self.state.get("last_compact_ts"))
+        if last_compact is not None and now - last_compact < timedelta(
+            minutes=self.config.compact_cooldown_minutes
+        ):
+            return
+
+        hard = percent >= self.config.compact_hard_percent
+        if not hard:
+            if last_human is None:
+                return
+            idle_minutes = (now - last_human).total_seconds() / 60
+            if idle_minutes < self.config.compact_min_idle_minutes:
+                return
+
+        # Never cut into a turn that is actively generating.
+        if self.sender.is_busy() is True:
+            log("INFO", f"compaction deferred at {percent:.0f}%: session is generating")
+            return
+
+        # Reserve before sending so a delivery failure cannot retry until the
+        # cooldown elapses and the context has genuinely moved on.
+        self.state["last_compact_ts"] = instant_text(now)
+        self.state["last_compact_tokens"] = tokens
+        self._save_state()
+        local_now = now.astimezone(self.config.local_tz)
+        command_line = f"/compact {self._compact_instruction(local_now)}"
+        try:
+            self.sender.send_compact(command_line)
+        except Exception as exc:
+            log(
+                "ERROR",
+                f"compaction send failed (retries after cooldown): "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+        threshold = "hard" if hard else "soft"
+        log(
+            "INFO",
+            f"compaction requested at {percent:.0f}% ({threshold} threshold, {tokens} tokens)",
+        )
+
     def run_once(self, now: datetime | None = None) -> None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         self._sync_history()
         self._save_state()
         last_human = self._last_human()
+        # Compaction can be due even before the first human message (context
+        # fills from wake activity too), so check it before the early return.
+        self._try_compact(current, last_human)
         if last_human is None:
             return
         self._try_night(current, last_human)
@@ -457,6 +696,91 @@ def install_managed_instructions(path: Path, human_name: str = "瓷瓷") -> None
     os.replace(temporary, path)
 
 
+def _entry_is_managed(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks") or []:
+        command = hook.get("command") if isinstance(hook, dict) else None
+        if isinstance(command, str) and command.startswith(MANAGED_HOOK_DIR_MARKER):
+            return True
+    return False
+
+
+def install_managed_settings(path: Path, hook_dir: Path | str) -> None:
+    """Merge our managed hooks and MCP allow-list into Eremia's settings.json.
+
+    Idempotent and additive: the human's own permissions and any hooks they
+    added by hand are preserved. Only the entries we own (identified by their
+    ``/opt/hooks/`` command path) are refreshed, so re-running on every boot
+    keeps the compaction hooks current without clobbering hand edits.
+    """
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+    allow = permissions.get("allow")
+    if not isinstance(allow, list):
+        allow = []
+    for entry in BASE_ALLOW:
+        if entry not in allow:
+            allow.append(entry)
+    permissions["allow"] = allow
+    data["permissions"] = permissions
+
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    # These are always container (POSIX) paths; normalize so a Windows build
+    # host can't smuggle in backslashes that break the managed-entry marker.
+    hook_base = str(hook_dir).replace("\\", "/").rstrip("/")
+    anchor_command = f"{hook_base}/session-anchor.sh"
+    backup_command = f"{hook_base}/backup-transcript.sh"
+
+    def rebuild(event: str, managed_entry: dict[str, Any]) -> None:
+        existing = hooks.get(event)
+        kept = [
+            entry
+            for entry in (existing if isinstance(existing, list) else [])
+            if isinstance(entry, dict) and not _entry_is_managed(entry)
+        ]
+        kept.append(managed_entry)
+        hooks[event] = kept
+
+    rebuild(
+        "SessionStart",
+        {
+            "matcher": "compact",
+            "hooks": [{"type": "command", "command": anchor_command}],
+        },
+    )
+    rebuild(
+        "PreCompact",
+        {"hooks": [{"type": "command", "command": backup_command}]},
+    )
+    data["hooks"] = hooks
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    os.replace(temporary, path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -470,11 +794,17 @@ def main() -> int:
         or os.environ.get("RELAY_HUMAN_NAME")
         or "瓷瓷",
     )
+    hooks_parser = subparsers.add_parser("install-hooks")
+    hooks_parser.add_argument("--path", required=True, type=Path)
+    hooks_parser.add_argument("--hook-dir", required=True, type=Path)
     args = parser.parse_args()
 
     try:
         if args.command == "install-instructions":
             install_managed_instructions(args.path, args.human_name.strip() or "瓷瓷")
+            return 0
+        if args.command == "install-hooks":
+            install_managed_settings(args.path, args.hook_dir)
             return 0
         config = Config.from_env()
         keeper = Timekeeper(config)

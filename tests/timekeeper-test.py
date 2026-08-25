@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -34,6 +36,41 @@ class FailingRelay(FakeRelay):
     def send_wake(self, text):
         self.sent.append(text)
         raise OSError("simulated relay outage")
+
+
+class FakeSender:
+    def __init__(self, busy=False):
+        self._busy = busy
+        self.sent = []
+
+    def is_busy(self):
+        return self._busy
+
+    def send_compact(self, command_line):
+        self.sent.append(command_line)
+
+
+def write_transcript(directory, input_tokens=0, cache_read=0, cache_creation=0, name="session.jsonl"):
+    path = Path(directory) / name
+    lines = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "cache_read_input_tokens": cache_read,
+                        "cache_creation_input_tokens": cache_creation,
+                        "output_tokens": 10,
+                    },
+                },
+            }
+        ),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 class TimekeeperTests(unittest.TestCase):
@@ -186,6 +223,197 @@ class TimekeeperTests(unittest.TestCase):
             self.assertNotIn("Sylvia", second)
             self.assertEqual(second.count(MODULE.MANAGED_BEGIN), 1)
             self.assertEqual(second.count(MODULE.MANAGED_END), 1)
+
+
+class ContextTokenTests(unittest.TestCase):
+    def test_reads_last_usage_and_sums_context_side_tokens(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            write_transcript(temp_dir, input_tokens=1000, cache_read=50000, cache_creation=2000)
+            self.assertEqual(MODULE.latest_context_tokens(temp_dir), 53000)
+
+    def test_picks_the_most_recently_modified_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            old = write_transcript(temp_dir, input_tokens=10000, name="old.jsonl")
+            new = write_transcript(temp_dir, input_tokens=80000, name="new.jsonl")
+            os.utime(old, (1_000, 1_000))
+            os.utime(new, (2_000, 2_000))
+            self.assertEqual(MODULE.latest_context_tokens(temp_dir), 80000)
+
+    def test_returns_none_without_transcripts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertIsNone(MODULE.latest_context_tokens(temp_dir))
+
+
+class CompactionTests(unittest.TestCase):
+    def config(self, state_dir: Path, transcript_dir: Path, **overrides):
+        values = dict(
+            relay_url="http://relay/relay",
+            relay_secret="test-secret",
+            state_dir=state_dir,
+            prompt_dir=SOURCE.parent / "prompts",
+            human_name="瓷瓷",
+            timezone_name="Asia/Shanghai",
+            local_tz=MODULE.load_timezone("Asia/Shanghai"),
+            checkin_enabled=False,
+            night_enabled=False,
+            transcript_dir=transcript_dir,
+            context_window_tokens=100000,
+            compact_soft_percent=78.0,
+            compact_hard_percent=88.0,
+            compact_min_idle_minutes=20,
+            compact_cooldown_minutes=30,
+        )
+        values.update(overrides)
+        return MODULE.Config(**values)
+
+    def keeper(self, state_dir, transcript_dir, sender, **overrides):
+        return MODULE.Timekeeper(
+            self.config(state_dir, transcript_dir, **overrides),
+            relay=FakeRelay([]),
+            sender=sender,
+        )
+
+    def test_soft_threshold_waits_for_a_lull_then_fires_in_erermias_voice(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=80000)  # 80%
+            now = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+
+            keeper._try_compact(now, now - timedelta(minutes=5))
+            self.assertEqual(sender.sent, [])
+
+            keeper._try_compact(now, now - timedelta(minutes=25))
+            self.assertEqual(len(sender.sent), 1)
+            self.assertTrue(sender.sent[0].startswith("/compact "))
+            self.assertIn("瓷瓷", sender.sent[0])
+            self.assertNotIn("\n", sender.sent[0])
+            self.assertEqual(keeper.state["last_compact_tokens"], 80000)
+
+    def test_below_soft_threshold_does_nothing(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=50000)  # 50%
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
+            self.assertEqual(sender.sent, [])
+
+    def test_hard_threshold_fires_without_a_lull_or_a_human_message(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=90000)  # 90%
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
+            self.assertEqual(len(sender.sent), 1)
+
+    def test_never_interrupts_a_generating_turn(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=95000)  # 95%, above hard
+            sender = FakeSender(busy=True)
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
+            self.assertEqual(sender.sent, [])
+
+    def test_disabled_watcher_is_silent(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=95000)
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender, compact_enabled=False)
+            keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
+            self.assertEqual(sender.sent, [])
+
+    def test_cooldown_and_stale_reading_prevent_double_compaction(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=90000)  # 90%
+            now = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+
+            keeper._try_compact(now, None)
+            self.assertEqual(len(sender.sent), 1)
+
+            # Same token count = no new turn since; the drop just isn't recorded.
+            keeper._try_compact(now + timedelta(minutes=5), None)
+            self.assertEqual(len(sender.sent), 1)
+
+            # New reading but still inside the cooldown window: still held.
+            write_transcript(tx, input_tokens=91000)
+            keeper._try_compact(now + timedelta(minutes=10), None)
+            self.assertEqual(len(sender.sent), 1)
+
+            # New reading after the cooldown elapses: fires again.
+            keeper._try_compact(now + timedelta(minutes=40), None)
+            self.assertEqual(len(sender.sent), 2)
+
+    def test_send_failure_is_reserved_not_retried_in_a_loop(self):
+        class BrokenSender(FakeSender):
+            def send_compact(self, command_line):
+                raise OSError("tmux gone")
+
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=90000)
+            now = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+            keeper = self.keeper(Path(state), Path(tx), BrokenSender())
+            keeper._try_compact(now, None)  # must not raise
+            # cooldown reserved so the next tick doesn't hammer a broken tmux
+            self.assertIsNotNone(keeper.state["last_compact_ts"])
+
+
+class SettingsTests(unittest.TestCase):
+    def test_install_hooks_from_empty_writes_managed_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            MODULE.install_managed_settings(path, "/opt/hooks")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["permissions"]["allow"], list(MODULE.BASE_ALLOW))
+            ss = data["hooks"]["SessionStart"]
+            self.assertEqual(ss[0]["matcher"], "compact")
+            self.assertEqual(ss[0]["hooks"][0]["command"], "/opt/hooks/session-anchor.sh")
+            pc = data["hooks"]["PreCompact"]
+            self.assertEqual(pc[0]["hooks"][0]["command"], "/opt/hooks/backup-transcript.sh")
+
+    def test_install_hooks_is_idempotent_and_preserves_user_edits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "permissions": {"allow": ["mcp__custom"]},
+                        "hooks": {
+                            "SessionStart": [
+                                {"hooks": [{"type": "command", "command": "/usr/local/bin/mine.sh"}]}
+                            ]
+                        },
+                        "model": "opus",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            MODULE.install_managed_settings(path, "/opt/hooks")
+            first = json.loads(path.read_text(encoding="utf-8"))
+            MODULE.install_managed_settings(path, "/opt/hooks")
+            second = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(first, second)
+            self.assertIn("mcp__custom", second["permissions"]["allow"])
+            for entry in MODULE.BASE_ALLOW:
+                self.assertIn(entry, second["permissions"]["allow"])
+            self.assertEqual(second["model"], "opus")
+
+            commands = [
+                hook["command"]
+                for entry in second["hooks"]["SessionStart"]
+                for hook in entry["hooks"]
+            ]
+            self.assertIn("/usr/local/bin/mine.sh", commands)
+            self.assertIn("/opt/hooks/session-anchor.sh", commands)
+            managed = [
+                entry
+                for entry in second["hooks"]["SessionStart"]
+                if any(h["command"].startswith("/opt/hooks/") for h in entry["hooks"])
+            ]
+            self.assertEqual(len(managed), 1)
+            self.assertEqual(managed[0]["matcher"], "compact")
 
 
 if __name__ == "__main__":

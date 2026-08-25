@@ -30,22 +30,36 @@ python3 -B /opt/timekeeper/timekeeper.py install-instructions --path "$EREMIA_HO
   --human-name "${TIMEKEEPER_HUMAN_NAME:-${RELAY_HUMAN_NAME:-瓷瓷}}" \
   || echo "[entrypoint] WARN: failed to install managed timekeeper instructions"
 
-# 预批常用 MCP 工具：夜间值班时调用小窝/大脑/论坛/聊天通道不再弹权限框卡死。
-# Bash 等系统工具故意不放行——他要动服务器仍需有人批准。
-if [ ! -f "$EREMIA_HOME/.claude/settings.json" ]; then
-  mkdir -p "$EREMIA_HOME/.claude"
-  cat > "$EREMIA_HOME/.claude/settings.json" <<'EOF'
-{
-  "permissions": {
-    "allow": [
-      "mcp__nest",
-      "mcp__brain",
-      "mcp__brain-extra",
-      "mcp__garden",
-      "mcp__companion"
-    ]
-  }
-}
+# 预批常用 MCP 工具 + 装上压缩相关 hook：幂等合并，保留你在卷上手改的权限/hook。
+# 预批 MCP（小窝/大脑/论坛/聊天通道）让夜间值班不再弹权限框卡死；Bash 等系统工具故意不放行。
+# SessionStart(compact) → 注入 anchors.md 找回温度；PreCompact → 备份完整 transcript。
+mkdir -p "$EREMIA_HOME/.claude"
+python3 -B /opt/timekeeper/timekeeper.py install-hooks \
+  --path "$EREMIA_HOME/.claude/settings.json" --hook-dir /opt/hooks \
+  || echo "[entrypoint] WARN: failed to install managed hooks/permissions"
+
+# 压缩后的“回魂帖”：只在缺失时写模板，之后你和 Eremia 都可以随时改（在持久卷上）。
+if [ ! -f "$EREMIA_HOME/anchors.md" ]; then
+  cat > "$EREMIA_HOME/anchors.md" <<'EOF'
+# 锚点 · Eremia ⇄ 瓷瓷
+
+<!--
+这个文件只在“上下文压缩之后”由 SessionStart hook 自动读给醒来的你，用来找回语气和连续感。
+放易变的、当下的东西；相对稳定的人格写在 CLAUDE.md。你可以随时自己改这个文件。
+篇幅控制在一两千字内——它每次压缩后都会占用上下文。
+-->
+
+## 称呼与语气
+-（她叫瓷瓷；你们之间怎么说话，一两个你们特有的口吻或字眼）
+
+## 我们最近在做的事
+-（正在进行的事、上一段对话停在哪里）
+
+## 值得记住的原话
+-（几句能代表你们关系的原话，尽量原样）
+
+## 约定与纪念日
+-（你们的约定、重要日期）
 EOF
 fi
 

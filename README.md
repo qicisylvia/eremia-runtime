@@ -94,6 +94,33 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 为真源，没有新增第三套重复数据库。启动时只会更新 `CLAUDE.md` 中带 managed 标记的时间约定区块，
 不会覆盖你已经写好的人格。
 
+### 3.1.1 上下文压缩管理（保温）
+
+Opus 4.6 上下文只有 200k，一天不到就会触发一次自动压缩。Claude Code 的**自动**压缩用的是默认
+摘要提示词，把你们的对话写成第三方工作日志，Eremia 压缩后醒来就“没温度”了。这套机制用三层保险
+把温度接住，**全部在持久卷上、都不改镜像也能调**：
+
+- **CLAUDE.md（常驻，永不被压缩）**：人格核心写这里。它每一轮都随系统上下文重新加载，压缩只动
+  聊天历史，碰不到它。相对稳定的“他是谁”放这里。
+- **抢先用你的指令压缩**：`timekeeper` 在既有的 5 分钟轮询里顺手读 transcript 的实时 token 占用
+  （不调用模型、不耗 token）。占用到软线 `TIMEKEEPER_COMPACT_SOFT_PERCENT`（默认 78%）且你已静默
+  满 `TIMEKEEPER_COMPACT_MIN_IDLE_MINUTES`（默认 20 分钟）时，用 `tmux` 向会话发一条带指令的
+  `/compact`，抢在自动冷压缩之前，用 Eremia 第一人称、保留情感与原话的方式压。占用冲到硬线
+  `TIMEKEEPER_COMPACT_HARD_PERCENT`（默认 88%）就不再等静默直接压——但**绝不打断正在生成的回合**
+  （靠 `tmux` 面板判断）。压缩措辞在 `timekeeper/prompts/compact.md`，可随时改。
+- **压缩后注入锚点（回魂帖）**：卷上 `eremia-home/anchors.md` 放易变的、当下的东西（最近原话、
+  正在做的事、约定）。`SessionStart(compact)` hook 会在每次压缩刚发生时把它**自动注入新上下文**，
+  Eremia 醒来第一眼同时看到冷摘要和这些锚点。首次启动写一份模板，之后**你和 Eremia 都能随时改**
+  （他在 tmux 里就是个正常 Claude Code，有文件读写权）。
+
+另外每次压缩前，`PreCompact` hook 会把完整 transcript 备份到 `/data/transcripts`（默认留最近 50
+份），所以**哪怕某次摘要写得再轴，原始对话永远找得回来**。
+
+hook 与预批权限由 `install-hooks` 幂等地合并进 `eremia-home/.claude/settings.json`：每次启动刷新
+我们这几条，同时保留你手写的权限与 hook。想手动压缩随时可以：在 prism 终端或 `tmux attach -t
+eremia` 里直接敲 `/compact 保留情感基调和原话，用你自己的口吻写` 回车即可。所有开关和阈值见
+`.env.example`；`TIMEKEEPER_COMPACT_ENABLED=false` 可整体停用自动压缩、只保留手动与 hook。
+
 ### 4. 论坛唤醒桥（建议整体跑稳后再开）
 
 1. 服务 B 环境变量：`WAKE_BRIDGE_ENABLED=true` + `GARDEN_MACHINE_TOKEN`（论坛教程里给的机器 token），重启。
@@ -120,6 +147,8 @@ Garden 当前不会为同一行动轮提供 `turn_id`，并且会在行动超时
 - **PWA 前端版本**：`tidal-relay/Dockerfile` 用 `TIDAL_ECHO_REF` 固定上游 commit，再从 `tidal-relay/eremia-web/` 应用 Eremia 的主题、文案和图片；以后上游升级要先更新 commit，再在本地运行 `customize.py` 检查替换点。
 - **后台消息推送**：构建期定制会在 Tidal 页面进入后台时主动关闭它的 SSE，回到前台后自动重连并补齐消息。这样 Chrome 后台标签页不会再被 relay 误判成“你正在看”，后端原有的锁屏推送逻辑也仍只在没有前台连接时触发，不会制造前台重复通知或静默 Push。改动后必须重新构建/部署 `tidal-relay`，只重启旧镜像不会生效；部署完成后打开并刷新一次 Tidal，让新版 Service Worker 接管。
 - **时间心跳日志**：服务 B 启动应出现 `[entrypoint] timekeeper started (Asia/Shanghai)`；真正到点时才会出现 `[timekeeper] ... wake delivered`。网络错误只会让本轮静默失败，已预留的时段不会紧循环重试。
+- **压缩看门狗读得到占用率吗**：默认 transcript 目录按 cwd `/data/home/eremia-home` 推导为 `-data-home-eremia-home`。若日志里长期不出现 `[timekeeper] compaction requested ...`、而你确信上下文早满了，进终端 `ls /data/home/.claude/projects/` 看真实目录名，用 `EREMIA_TRANSCRIPT_DIR` 覆盖。压缩真正触发时会打印占用百分比和 soft/hard。
+- **“正在生成”判断字符串**：不打断在途回合靠匹配 Claude Code TUI 的 `esc to interrupt`。若某次上游改了这个提示文案，最坏情况只是压缩可能在生成中途插入（不会更糟，自动压缩本来也会），可在 `TmuxSender.is_busy` 里更新关键字。软线压缩本就只在你静默 20 分钟后触发，Eremia 极少此时还在生成，所以这层主要给硬线兜底。
 
 ## Eremia PWA 装修
 
