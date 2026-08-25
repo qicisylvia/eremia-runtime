@@ -36,6 +36,49 @@ def decode_assets(bundle: Path, web: Path) -> None:
         target.write_bytes(base64.b64decode(payload, validate=True))
 
 
+def customize_background_stream(text: str) -> str:
+    """Release the relay SSE slot whenever this page is actually hidden.
+
+    Tidal Echo sends Web Push only when no PWA stream is connected. Chromium
+    can keep an EventSource alive in a background tab, so the relay mistakes a
+    hidden page for an actively watched one. Closing only that browser-side
+    stream preserves the relay's existing, user-visible push semantics.
+    """
+    text = replace_once(
+        text,
+        "function openStream(){\n",
+        """function suspendHiddenStream(){
+  if (es){ try{ es.close(); }catch(e){} es = null; }
+  connected = false;
+}
+function openStream(){
+  // Do not let a hidden Chromium tab suppress the relay's unread Web Push.
+  if (!USE_MOCK && document.hidden){ suspendHiddenStream(); return; }
+""",
+        "hidden stream guard",
+    )
+    return replace_once(
+        text,
+        '''document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || !secret) return;
+  backfill();
+  refreshContextStatus();
+  if (!es || es.readyState !== 1 || Date.now() - lastStreamEventAt > STREAM_STALE_MS) openStream();
+});''',
+        '''document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible"){
+    suspendHiddenStream();
+    return;
+  }
+  if (!secret) return;
+  backfill();
+  refreshContextStatus();
+  openStream();
+});''',
+        "visibility stream lifecycle",
+    )
+
+
 def customize_index(bundle: Path, web: Path) -> None:
     path = web / "index.html"
     text = path.read_text(encoding="utf-8")
@@ -96,6 +139,7 @@ def customize_index(bundle: Path, web: Path) -> None:
         '<script src="eremia.js"></script>\n</body>\n</html>',
         "brand script",
     )
+    text = customize_background_stream(text)
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
@@ -122,7 +166,7 @@ def customize_worker(web: Path) -> None:
     path = web / "sw.js"
     text = path.read_text(encoding="utf-8")
     text, ai_count = re.subn(r'^const AI_NAME = ".*?";', f'const AI_NAME = "{AI_NAME}";', text, count=1, flags=re.M)
-    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v4";', text, count=1, flags=re.M)
+    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v6";', text, count=1, flags=re.M)
     if ai_count != 1 or cache_count != 1:
         raise RuntimeError("service worker identity/cache markers changed upstream")
     text = replace_once(

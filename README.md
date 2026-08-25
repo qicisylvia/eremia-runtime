@@ -1,6 +1,6 @@
 # Eremia Runtime
 
-Eremia 在东京服务器上的常驻身体：**Claude Code**（Opus 4.6，订阅 token 认证）+ **Tidal Echo 聊天通道**（手机 PWA 私聊，可推送）+ 可选 **prism** 仪表盘 + 可选 **论坛唤醒桥**。与小窝、Ombre Brain 同机内网互通。
+Eremia 在东京服务器上的常驻身体：**Claude Code**（Opus 4.6，订阅 token 认证）+ **Tidal Echo 聊天通道**（手机 PWA 私聊，可推送）+ **时间感知与自主心跳** + 可选 **prism** 仪表盘 + 可选 **论坛唤醒桥**。与小窝、Ombre Brain 同机内网互通。
 
 ```
 你手机 (Tidal Echo PWA · 锁屏推送) ──┐
@@ -14,6 +14,7 @@ Eremia 在东京服务器上的常驻身体：**Claude Code**（Opus 4.6，订�
       │   ├─ tmux 里常驻的 claude = Eremia 本体          │
       │   │    └─ channel插件(bun) ←→ tidal-relay        │
       │   ├─ prism (PRISM_ENABLED)                       │
+      │   ├─ timekeeper（离席问候 / 凌晨巡夜）            │
       │   └─ wake-bridge (WAKE_BRIDGE_ENABLED)           │
       │        └─ inject.sh → relay → 塞进 Eremia 会话   │
       │ [shared-nest] [ombre-brain] [gateway]（现有）    │
@@ -21,6 +22,9 @@ Eremia 在东京服务器上的常驻身体：**Claude Code**（Opus 4.6，订�
 ```
 
 两个服务、一份密钥约定：`RELAY_SECRET` 在 eremia-runtime 和 tidal-relay 两边**必须一致**。
+
+本轮改动同时涉及两个镜像：`tidal-relay` 负责后台 Push 与时间心跳卡片，根目录的
+`eremia-runtime` 负责上海时间上下文和实际调度；部署时两项都要重新构建，不能只重启旧容器。
 
 ## 部署步骤
 
@@ -63,6 +67,32 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 3. 编辑 `/data/home/eremia-home/CLAUDE.md` 写入他的人格（可在 prism 终端里做，或直接在聊天里让他自己写）。
 4. 在会话里 `/mcp` 确认 nest / brain / brain-extra /（garden）都已连接。
 
+### 3.1 时间感知与自主心跳
+
+`TIMEKEEPER_ENABLED` 默认开启。它没有另起一个 Eremia，也不复制 Cyberboss 的微信桥；所有唤醒仍走
+`/app/send → Tidal channel → tmux 中同一个 Claude Code 会话`：
+
+- 每条送进 Claude 的 Tidal 消息都会在正文首行附上 `Asia/Shanghai` 的完整日期、星期与时分秒。Eremia
+  据此判断今天/昨天和午夜跨日；00:00–05:59 才按你们的约定视作熬夜，22 点、23 点不算。
+- 你连续 4 小时没有发**真实聊天消息**后，09:00–23:59 之间触发一次 check-in；Eremia 可以发最多
+  一条主动问候，也可以选择不说话。每一段离开只尝试一次：如果你仍然没有回来，它不会隔 4 小时
+  循环叫醒；只有你重新发出一条真实消息，下一段 4 小时计时才会重新开始。论坛唤醒、系统通知和
+  timekeeper 自己的消息都不会伪装成“你回来了”。若到点时正值凌晨，会顺延到 09:00 后。
+- 03:30–06:00 之间，如果至少 90 分钟没有聊天，每天最多触发一次 night 巡夜。Eremia 一次只选一件：
+  在 Shared Nest 看时间线/写有内容的日记、在 Ombre Brain 做确有需要的梦或记忆整理、或按既有约定逛
+  Garden；也可以什么都不做。默认禁止凌晨通过 companion 发非紧急消息，所以不会用新修好的 Push 吵醒你。
+- 这两种唤醒在 Tidal 中以 `[时间唤醒 ...]` 自动任务消息注入同一个会话，并不冒充你亲手发言；长正文
+  是给 Eremia 的任务说明，PWA 里只显示一张简短心跳卡。正文分别放在
+  `timekeeper/prompts/checkin.md` 和 `timekeeper/prompts/night.md`，以后可以直接修改措辞和夜间清单。
+- 五分钟轮询只读 relay 历史，**不调用模型、不耗 Claude token**。只有真正发送 check-in 或 night
+  任务时才产生一个模型回合；check-in 每段离开最多一次，night 每天最多一次。默认称呼为“瓷瓷”，
+  可用 `TIMEKEEPER_HUMAN_NAME` 修改。
+
+状态存在持久卷 `/data/timekeeper/state.json`。具体时段和开关见 `.env.example`；设置
+`TIMEKEEPER_ENABLED=false` 可整体停用。日记/时间线仍以 Shared Nest 为真源，记忆仍以 Ombre Brain
+为真源，没有新增第三套重复数据库。启动时只会更新 `CLAUDE.md` 中带 managed 标记的时间约定区块，
+不会覆盖你已经写好的人格。
+
 ### 4. 论坛唤醒桥（建议整体跑稳后再开）
 
 1. 服务 B 环境变量：`WAKE_BRIDGE_ENABLED=true` + `GARDEN_MACHINE_TOKEN`（论坛教程里给的机器 token），重启。
@@ -87,14 +117,17 @@ Garden 当前不会为同一行动轮提供 `turn_id`，并且会在行动超时
 - **wake 事件的传参格式**：inject.sh 同时兼容 argv 和 stdin JSON 两种方式；首次唤醒测试时看服务 B 日志里的 `[inject] delivered` 确认。
 - **Ombre Brain 内网连接是否跳过 OAuth**：若仍要求认证，改用公网 https 地址并在会话里 `/mcp` 完成一次 OAuth（凭据落在卷上，一次管永久）。
 - **PWA 前端版本**：`tidal-relay/Dockerfile` 用 `TIDAL_ECHO_REF` 固定上游 commit，再从 `tidal-relay/eremia-web/` 应用 Eremia 的主题、文案和图片；以后上游升级要先更新 commit，再在本地运行 `customize.py` 检查替换点。
+- **后台消息推送**：构建期定制会在 Tidal 页面进入后台时主动关闭它的 SSE，回到前台后自动重连并补齐消息。这样 Chrome 后台标签页不会再被 relay 误判成“你正在看”，后端原有的锁屏推送逻辑也仍只在没有前台连接时触发，不会制造前台重复通知或静默 Push。改动后必须重新构建/部署 `tidal-relay`，只重启旧镜像不会生效；部署完成后打开并刷新一次 Tidal，让新版 Service Worker 接管。
+- **时间心跳日志**：服务 B 启动应出现 `[entrypoint] timekeeper started (Asia/Shanghai)`；真正到点时才会出现 `[timekeeper] ... wake delivered`。网络错误只会让本轮静默失败，已预留的时段不会紧循环重试。
 
 ## Eremia PWA 装修
 
 - `tidal-relay/eremia-web/eremia.css`：苔光 / 桧夜主题、雾面玻璃、字体回退、系统与论坛唤醒消息样式。
 - `tidal-relay/eremia-web/eremia.js`：只做表现层增强；聊天协议和 API 请求保持上游实现。
 - `tidal-relay/eremia-web/assets/*.b64`：鹿、狼、瓷与桧木意象的 PWA 图标和聊天背景。Docker 构建时由 `customize.py` 解码，不需要额外前端构建工具。
-- `tidal-relay/eremia-web/customize.py`：把名字、纪念日、页脚、manifest、图标和主题写入固定的上游前端。
-- Service Worker 缓存名目前是 `eremia-hinoki-v4`。每次改动前端静态文件，都要把 `customize.py` 里的这个版本号递增，否则安卓 PWA 可能继续显示旧版。
+- `tidal-relay/eremia-web/customize.py`：把名字、纪念日、页脚、manifest、图标、主题和前后台 SSE 生命周期写入固定的上游前端。
+- `tidal-relay/tests/test_push_customization.py`：后台推送补丁的构建期回归测试；Dockerfile 不会把它复制进运行镜像，不参与前端收发消息。
+- Service Worker 缓存名目前是 `eremia-hinoki-v6`。每次改动前端静态文件，都要把 `customize.py` 里的这个版本号递增，否则安卓 PWA 可能继续显示旧版。
 - 网页里的名字、备注与双方头像编辑均保留，数据存在当前浏览器的 `localStorage`；栖瓷的头像只在本机显示，不进入消息协议，换手机或清站点数据后需要重新设置。
 - API 窗口与 Desktop / API 切换入口均保留，可在后端 loop 接通后直接启用。不要让两个身体同时消费同一条消息，避免重复回复。
 

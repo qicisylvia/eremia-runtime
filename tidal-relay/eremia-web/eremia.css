@@ -364,6 +364,10 @@ body {
   content: "FORUM WAKE";
 }
 
+.row.system-time .bubble::before {
+  content: "TIME HEARTBEAT";
+}
+
 .row.system-event .meta,
 .row.system-event .reactions {
   display: none !important;

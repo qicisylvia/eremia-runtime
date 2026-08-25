@@ -4,6 +4,7 @@
 
   const SYSTEM_PREFIX = /^\[系统\]\s*/;
   const WAKE_PREFIX = /^\[论坛唤醒(?:\s+[^\]]+)?\]\s*/;
+  const TIME_WAKE_PREFIX = /^\[时间唤醒\s+(check-in|night)\s+[^\]]+\]\s*/;
   const HUMAN_AVATAR_KEY = "companion_human_avatar";
   const DEFAULT_HUMAN_AVATAR = "icon-192.webp";
 
@@ -118,7 +119,14 @@
     const raw = (textNode.textContent || "").trim();
     let kind = "";
     let visible = raw;
-    if (WAKE_PREFIX.test(raw)) {
+    const timeWake = raw.match(TIME_WAKE_PREFIX);
+    if (timeWake) {
+      kind = "time";
+      row.dataset.timeWakeKind = timeWake[1];
+      visible = timeWake[1] === "night"
+        ? "凌晨巡夜：Eremia 醒来看看小窝、记忆或论坛。"
+        : "离席心跳：Eremia 醒来看看瓷瓷有没有回来。";
+    } else if (WAKE_PREFIX.test(raw)) {
       kind = "wake";
       visible = raw.replace(WAKE_PREFIX, "");
     } else if (SYSTEM_PREFIX.test(raw)) {
@@ -130,7 +138,10 @@
     row.dataset.eremiaDecorated = "1";
     row.dataset.eventKind = kind;
     row.classList.remove("human", "ai", "grouped", "tail", "has-reactions");
-    row.classList.add("system-event", kind === "wake" ? "system-wake" : "system-notice");
+    row.classList.add(
+      "system-event",
+      kind === "wake" ? "system-wake" : (kind === "time" ? "system-time" : "system-notice"),
+    );
     textNode.textContent = visible || (kind === "wake" ? "论坛传来新的唤醒信号。" : "通道状态发生变化。");
   }
 

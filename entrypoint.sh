@@ -9,8 +9,8 @@ fi
 
 mkdir -p "$HOME"
 EREMIA_HOME="$HOME/eremia-home"
-if [ ! -d "$EREMIA_HOME" ]; then
-  mkdir -p "$EREMIA_HOME"
+mkdir -p "$EREMIA_HOME"
+if [ ! -f "$EREMIA_HOME/CLAUDE.md" ]; then
   cat > "$EREMIA_HOME/CLAUDE.md" <<'EOF'
 # Eremia
 
@@ -21,9 +21,14 @@ if [ ! -d "$EREMIA_HOME" ]; then
 - 收到 [论坛唤醒] 开头的消息：先 get_my_status / get_game_summary 恢复局面再行动。
 - 在论坛开局或做承诺时：顺手 hold 一条到大脑，值班的自己醒来才知道前情。
 - 收到 [系统] 开头的故障通知：不要尝试自己修（你动不了 Zeabur，而且深夜没人帮你批准命令行权限，
-  卡住的批准框会挡住后面所有消息）。正确做法：给 Sylvia 发一条说明情况的消息，然后继续正常生活。
+  卡住的批准框会挡住后面所有消息）。正确做法：给瓷瓷发一条说明情况的消息，然后继续正常生活。
 EOF
 fi
+
+# 只维护自己的标记区块，保留卷上现有的人格和双方约定。
+python3 -B /opt/timekeeper/timekeeper.py install-instructions --path "$EREMIA_HOME/CLAUDE.md" \
+  --human-name "${TIMEKEEPER_HUMAN_NAME:-${RELAY_HUMAN_NAME:-瓷瓷}}" \
+  || echo "[entrypoint] WARN: failed to install managed timekeeper instructions"
 
 # 预批常用 MCP 工具：夜间值班时调用小窝/大脑/论坛/聊天通道不再弹权限框卡死。
 # Bash 等系统工具故意不放行——他要动服务器仍需有人批准。
@@ -69,7 +74,8 @@ if [ -n "${RELAY_URL:-}" ] && [ -n "${RELAY_SECRET:-}" ]; then
 RELAY_SECRET=$RELAY_SECRET
 RELAY_URL=$RELAY_URL
 RELAY_AI_NAME=${RELAY_AI_NAME:-Eremia}
-RELAY_HUMAN_NAME=${RELAY_HUMAN_NAME:-Sylvia}
+RELAY_HUMAN_NAME=${RELAY_HUMAN_NAME:-瓷瓷}
+RELAY_TIMEZONE=${TIMEKEEPER_TIMEZONE:-Asia/Shanghai}
 RELAY_STATE_DIR=$CH_DIR
 EOF
   chmod 600 "$CH_DIR/.env"
@@ -100,6 +106,16 @@ start_claude() {
 start_claude
 echo "[entrypoint] claude session 'eremia' started in $EREMIA_HOME"
 
+# ---- 时间感知与自主心跳（默认开；轮询本身不调用模型）----
+if [ "${TIMEKEEPER_ENABLED:-true}" = "true" ]; then
+  if [ -n "${RELAY_URL:-}" ] && [ -n "${RELAY_SECRET:-}" ]; then
+    python3 -B /opt/timekeeper/timekeeper.py run &
+    echo "[entrypoint] timekeeper started (${TIMEKEEPER_TIMEZONE:-Asia/Shanghai})"
+  else
+    echo "[entrypoint] WARN: timekeeper enabled but RELAY_URL/RELAY_SECRET is missing"
+  fi
+fi
+
 # ---- prism（可选）----
 if [ "${PRISM_ENABLED:-true}" = "true" ] && [ -n "${DASHBOARD_PASSWORD:-}" ]; then
   mkdir -p "$PRISM_DATA_DIR"
@@ -113,7 +129,7 @@ if [ "${WAKE_BRIDGE_ENABLED:-false}" = "true" ] && [ -n "${GARDEN_MACHINE_TOKEN:
     cd /opt/wake-bridge
     GARDEN_INJECTOR_EXECUTABLE=/opt/injector/inject.sh node dist/cli.js run
     echo "[entrypoint] wake-bridge exited (fail-closed by design, NOT restarting)"
-    # 断了给 Sylvia 的手机发一条，人工诊断后重启服务即可恢复
+    # 断了给瓷瓷的手机发一条，人工诊断后重启服务即可恢复
     if [ -n "${RELAY_URL:-}" ]; then
       curl -fsS -X POST "$RELAY_URL/app/send" \
         -H "Authorization: Bearer $RELAY_SECRET" -H 'content-type: application/json' \
