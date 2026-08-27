@@ -112,6 +112,8 @@ class TimekeeperTests(unittest.TestCase):
             self.assertEqual(len(relay.sent), 1)
             self.assertTrue(relay.sent[0].startswith("[时间唤醒 check-in"))
             self.assertIn("瓷瓷", relay.sent[0])
+            self.assertIn("一件自己想做的小事", relay.sent[0])
+            self.assertIn("anchors.md", relay.sent[0])
             self.assertEqual(keeper.state["last_human_id"], 1)
             self.assertEqual(keeper.state["checkin_for_human_id"], 1)
 
@@ -170,6 +172,8 @@ class TimekeeperTests(unittest.TestCase):
             self.assertIn("瓷瓷", relay.sent[0])
             self.assertIn("2026-08-26 04:00", relay.sent[0])
             self.assertNotIn("{{human_name}}", relay.sent[0])
+            self.assertIn("有想说的话也可以给她发消息", relay.sent[0])
+            self.assertIn("两者都做", relay.sent[0])
             self.assertEqual(keeper.state["night_last_date"], "2026-08-26")
 
     def test_night_wake_has_a_safe_fallback_when_prompt_file_is_missing(self):
@@ -189,7 +193,8 @@ class TimekeeperTests(unittest.TestCase):
             keeper.run_once(now)
 
             self.assertEqual(len(relay.sent), 1)
-            self.assertIn("默认不要调用 companion.reply", relay.sent[0])
+            self.assertIn("有想说的话也可以给她发消息", relay.sent[0])
+            self.assertIn("两者都做", relay.sent[0])
             self.assertIn("瓷瓷", relay.sent[0])
 
     def test_failed_delivery_is_reserved_instead_of_retried_in_a_loop(self):
@@ -221,8 +226,39 @@ class TimekeeperTests(unittest.TestCase):
             self.assertIn("我的自定义人格。", second)
             self.assertIn("瓷瓷", second)
             self.assertNotIn("Sylvia", second)
+            self.assertIn("无需因为凌晨时段而禁用", second)
+            self.assertIn("两者都做", second)
             self.assertEqual(second.count(MODULE.MANAGED_BEGIN), 1)
             self.assertEqual(second.count(MODULE.MANAGED_END), 1)
+
+    def test_install_migrates_only_the_exact_legacy_base_template(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "CLAUDE.md"
+            path.write_text(
+                MODULE.LEGACY_BASE_TEMPLATE + "\n我的自定义人格。\n",
+                encoding="utf-8",
+            )
+
+            MODULE.install_managed_instructions(path, "瓷瓷")
+            content = path.read_text(encoding="utf-8")
+
+            self.assertIn(MODULE.BASE_TEMPLATE.rstrip(), content)
+            self.assertNotIn("在论坛开局或做承诺时", content)
+            self.assertIn("我的自定义人格。", content)
+
+    def test_install_does_not_rewrite_a_user_edited_base(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "CLAUDE.md"
+            custom = MODULE.LEGACY_BASE_TEMPLATE.replace(
+                "先 breath 睁眼，再看小窝", "先抱抱瓷瓷，再 breath 睁眼"
+            )
+            path.write_text(custom, encoding="utf-8")
+
+            MODULE.install_managed_instructions(path, "瓷瓷")
+            content = path.read_text(encoding="utf-8")
+
+            self.assertIn("先抱抱瓷瓷，再 breath 睁眼", content)
+            self.assertIn("在论坛开局或做承诺时", content)
 
 
 class ContextTokenTests(unittest.TestCase):
@@ -366,6 +402,7 @@ class SettingsTests(unittest.TestCase):
             MODULE.install_managed_settings(path, "/opt/hooks")
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(data["permissions"]["allow"], list(MODULE.BASE_ALLOW))
+            self.assertIn("Edit(/anchors.md)", data["permissions"]["allow"])
             ss = data["hooks"]["SessionStart"]
             self.assertEqual(ss[0]["matcher"], "compact")
             self.assertEqual(ss[0]["hooks"][0]["command"], "/opt/hooks/session-anchor.sh")

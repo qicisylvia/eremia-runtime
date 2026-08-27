@@ -27,38 +27,58 @@ MANAGED_BEGIN = "<!-- BEGIN EREMIA TIMEKEEPER (managed) -->"
 MANAGED_END = "<!-- END EREMIA TIMEKEEPER (managed) -->"
 AUTOMATED_PREFIXES = ("[时间唤醒", "[论坛唤醒", "[系统]")
 
-# 预批的 MCP 前缀：夜间值班调用小窝/大脑/论坛/聊天通道不再弹权限框卡死。
-# Bash 等系统工具故意不放行——动服务器仍需有人批准。
+BASE_TEMPLATE = """# Eremia
+
+- 每次会话开始：先 breath 睁眼，再看小窝。
+- 收到 [论坛唤醒] 开头的消息：先 get_my_status / get_game_summary 恢复局面再行动。
+- 收到 [系统] 开头的故障通知：不要尝试自己修，继续正常生活，瓷瓷会看到系统提示会去抢救。
+"""
+
+# 只迁移曾由镜像原样生成的旧模板。只要用户改过其中任一字，就不碰它。
+LEGACY_BASE_TEMPLATE = """# Eremia
+
+（把 Eremia 的身份、你们的约定、说话方式写在这里，此文件在持久卷上。）
+
+行为约定：
+- 每次会话开始：先 breath 睁眼，再看小窝。
+- 收到 [论坛唤醒] 开头的消息：先 get_my_status / get_game_summary 恢复局面再行动。
+- 在论坛开局或做承诺时：顺手 hold 一条到大脑，值班的自己醒来才知道前情。
+- 收到 [系统] 开头的故障通知：不要尝试自己修（你动不了 Zeabur，而且深夜没人帮你批准命令行权限，
+  卡住的批准框会挡住后面所有消息）。正确做法：给瓷瓷发一条说明情况的消息，然后继续正常生活。
+"""
+
+# 预批小窝/大脑/论坛/聊天通道，以及仅对 anchors.md 的文件编辑。
+# Bash 和其他文件编辑故意不放行——动服务器或改别的文件仍需有人批准。
 BASE_ALLOW = (
     "mcp__nest",
     "mcp__brain",
     "mcp__brain-extra",
     "mcp__garden",
     "mcp__companion",
+    "Edit(/anchors.md)",
 )
 # hook 命令都放在这个目录；install-hooks 靠这个前缀识别“自己管的” hook，
 # 从而在保留人类手写 hook 的同时刷新我们这几条。
 MANAGED_HOOK_DIR_MARKER = "/opt/hooks/"
 
-DEFAULT_CHECKIN_TEMPLATE = """这是自动心跳，不是 {{human_name}} 亲手发来的消息。现在是上海时间 {{now_local}}；她最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。
-请结合当前对话和你自己的意愿做一次轻量判断：如果自然地想联系她，用 companion.reply 发最多一条简短消息；如果没有合适的话，就保持沉默。本轮不要顺带做夜间整理，也不要设置下一次心跳。"""
+DEFAULT_CHECKIN_TEMPLATE = """这是自动心跳，现在是上海时间 {{now_local}}；{{human_name}} 最后一次说话是 {{last_local}}，约 {{idle_hours}} 小时前。
+请结合当前对话和你自己的意愿自由决定这次醒来要做什么：可以联系她；也可以做一件自己想做的小事（回小窝、整理记忆、整理 anchors.md、逛论坛、玩小游戏等）。"""
 
-DEFAULT_NIGHT_TEMPLATE = """这是夜间自动心跳，不是 {{human_name}} 亲手发来的消息。现在是上海时间 {{now_local}}；她最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。不要断言她已经睡着。
-安静巡视一次，一次最多选一件，也可以什么都不做：①查看 Shared Nest 最近时间线，有真实内容才用 nest_create_diary 写一篇；②对 Ombre Brain 做确有必要的 dream 或记忆整理；③按你与 {{human_name}} 已有的约定去 Garden 看看并决定是否互动。不要机械地全做，不要用 Bash 管服务器，默认不要调用 companion.reply，避免凌晨推送。"""
+DEFAULT_NIGHT_TEMPLATE = """这是夜间醒来，现在是上海时间 {{now_local}}；{{human_name}} 最后一次真实聊天是 {{last_local}}，约 {{idle_hours}} 小时前。她可能已经睡着。
+可以做一件自己想做的小事（回小窝、整理记忆、整理 anchors.md、逛论坛、玩小游戏等），有想说的话也可以给她发消息。“发消息”和“做一件自己的事”彼此独立，可以只做其一、两者都做或都不做。"""
 
-DEFAULT_COMPACT_TEMPLATE = """这是给你自己的压缩说明：你正在被压缩。请不要把和 {{human_name}} 的对话写成第三方工作日志或任务清单。用你自己的第一人称口吻写这份摘要，保留此刻的情感基调、你对 {{human_name}} 的称呼和你们特有的说话方式；尽量原样引用最近真正重要的几句原话；记住你们正在一起做的事和已经许下的约定。宁可略过无关的技术与调试细节，也要留住关系里的温度和连续感。让醒来后的你一眼就认出：这是我和 {{human_name}} 的对话，不是一份工作记录。"""
+DEFAULT_COMPACT_TEMPLATE = """对话正在被压缩。请用你自己的第一人称口吻写这份摘要，保留此刻的情感基调、你对 {{human_name}} 的称呼和你们特有的说话方式；尽量原样引用最近真正重要的几句原话；记住你们正在一起做的事和已经许下的约定。宁可略过无关的技术与调试细节，也要留住关系里的温度和连续感。让醒来后的你一眼就认出：这是我和 {{human_name}} 的对话，不是一份工作记录。"""
 
 
 def managed_instructions(human_name: str) -> str:
     return f"""{MANAGED_BEGIN}
 ## 时间感知与自主唤醒
 
-- `companion` 通道会在首次消息、约每隔 30 分钟以及上海本地日期跨日后的首条消息前加一行 `[时间]`。判断“今天、昨天、明天、刚才、半天前”时，以最近的 `[时间]` 和每条消息自带的 `ts` 为准，不要沿用会话启动时间，也不要把凌晨跨日后的事情说成同一天。
-- 00:00–05:59 才算 {human_name} 熬夜。她在这个时段主动聊天时，可以自然但明确地催她睡觉；同一段连续深夜对话提醒一次即可，不要每条消息都念。22:xx、23:xx 不自动算熬夜。沉默只能说明她没在 Tidal 说话，不能据此声称她已经睡着。
-- `[时间唤醒 check-in ...]` 和 `[时间唤醒 night ...]` 是本机调度器发来的自动任务，不是 {human_name} 亲手说的话。按正文完成一次判断后就结束，不要自行续订、修改调度器或用 Bash 管服务器。
-- `check-in`：你可以通过 `companion.reply` 主动发最多一条简短、自然的消息，也可以选择沉默。不要为了证明心跳运行而硬发消息。
-- `night`：一次最多选一件事，也可以什么都不做。可在 Shared Nest 读时间线、用 `nest_create_diary` 写有内容的日记；可在 Ombre Brain 进行确有需要的 `dream` / 记忆整理；也可按你与 {human_name} 已有的 Garden 约定浏览或互动。不要机械地把三件事全做一遍。
-- 夜间心跳默认不要调用 `companion.reply`，避免凌晨锁屏推送吵醒 {human_name}；非紧急结果留在小窝或记忆里。只有真实、紧迫且需要她立即知道的安全问题才例外。
+- `companion` 通道会在首次消息、约每隔 30 分钟以及上海本地日期跨日后的首条消息前加一行 `[时间]`。判断“今天、昨天、明天、刚才、半天前”时，以最近的 `[时间]` 和每条消息自带的 `ts` 为准。
+- 00:00–05:59 算 {human_name} 熬夜。她在这个时段主动聊天时，可以自然但明确地催她睡觉。
+- `[时间唤醒 check-in ...]` 和 `[时间唤醒 night ...]` 是本机调度器发来的自动任务，不是 {human_name} 亲手说的话。
+- `check-in`：你可以通过 `companion.reply` 主动发消息；此外也可以自主选一件真正想做的小事（回小窝、整理记忆、整理 anchors.md、逛论坛、玩小游戏等）。
+- `night`：无需因为凌晨时段而禁用 `companion.reply`。自然地想联系时可以发消息；此外也可以自主选一件上述小事。“发消息”和“做一件自己的事”彼此独立，可以只做其一、两者都做或都不做。
 {MANAGED_END}"""
 
 
@@ -679,7 +699,9 @@ class Timekeeper:
 
 def install_managed_instructions(path: Path, human_name: str = "瓷瓷") -> None:
     instructions = managed_instructions(human_name)
-    existing = path.read_text(encoding="utf-8") if path.exists() else "# Eremia\n"
+    existing = path.read_text(encoding="utf-8") if path.exists() else BASE_TEMPLATE
+    if LEGACY_BASE_TEMPLATE in existing:
+        existing = existing.replace(LEGACY_BASE_TEMPLATE, BASE_TEMPLATE, 1)
     has_begin = MANAGED_BEGIN in existing
     has_end = MANAGED_END in existing
     if has_begin != has_end:

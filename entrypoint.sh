@@ -14,14 +14,9 @@ if [ ! -f "$EREMIA_HOME/CLAUDE.md" ]; then
   cat > "$EREMIA_HOME/CLAUDE.md" <<'EOF'
 # Eremia
 
-（把 Eremia 的身份、你们的约定、说话方式写在这里，此文件在持久卷上。）
-
-行为约定：
 - 每次会话开始：先 breath 睁眼，再看小窝。
 - 收到 [论坛唤醒] 开头的消息：先 get_my_status / get_game_summary 恢复局面再行动。
-- 在论坛开局或做承诺时：顺手 hold 一条到大脑，值班的自己醒来才知道前情。
-- 收到 [系统] 开头的故障通知：不要尝试自己修（你动不了 Zeabur，而且深夜没人帮你批准命令行权限，
-  卡住的批准框会挡住后面所有消息）。正确做法：给瓷瓷发一条说明情况的消息，然后继续正常生活。
+- 收到 [系统] 开头的故障通知：不要尝试自己修，继续正常生活，瓷瓷会看到系统提示会去抢救。
 EOF
 fi
 
@@ -30,8 +25,8 @@ python3 -B /opt/timekeeper/timekeeper.py install-instructions --path "$EREMIA_HO
   --human-name "${TIMEKEEPER_HUMAN_NAME:-${RELAY_HUMAN_NAME:-瓷瓷}}" \
   || echo "[entrypoint] WARN: failed to install managed timekeeper instructions"
 
-# 预批常用 MCP 工具 + 装上压缩相关 hook：幂等合并，保留你在卷上手改的权限/hook。
-# 预批 MCP（小窝/大脑/论坛/聊天通道）让夜间值班不再弹权限框卡死；Bash 等系统工具故意不放行。
+# 预批常用工具 + 装上压缩相关 hook：幂等合并，保留你在卷上手改的权限/hook。
+# 小窝/大脑/论坛/聊天通道与 anchors.md 编辑不再弹权限框；Bash 等系统工具故意不放行。
 # SessionStart(compact) → 注入 anchors.md 找回温度；PreCompact → 备份完整 transcript。
 mkdir -p "$EREMIA_HOME/.claude"
 python3 -B /opt/timekeeper/timekeeper.py install-hooks \
@@ -143,7 +138,7 @@ if [ "${WAKE_BRIDGE_ENABLED:-false}" = "true" ] && [ -n "${GARDEN_MACHINE_TOKEN:
     cd /opt/wake-bridge
     GARDEN_INJECTOR_EXECUTABLE=/opt/injector/inject.sh node dist/cli.js run
     echo "[entrypoint] wake-bridge exited (fail-closed by design, NOT restarting)"
-    # 断了给瓷瓷的手机发一条，人工诊断后重启服务即可恢复
+    # 等待瓷瓷诊断后重启服务即可恢复
     if [ -n "${RELAY_URL:-}" ]; then
       curl -fsS -X POST "$RELAY_URL/app/send" \
         -H "Authorization: Bearer $RELAY_SECRET" -H 'content-type: application/json' \
