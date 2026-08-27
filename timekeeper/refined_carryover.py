@@ -36,7 +36,6 @@ import copy
 import json
 import os
 import re
-import sys
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -107,8 +106,10 @@ _CJK_RE = re.compile(
 
 
 def log(level: str, message: str) -> None:
+    # stdout, matching timekeeper.log(), so an interactive dry-run in the prism
+    # terminal (which surfaces stdout) actually shows its report and errors.
     stamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-    print(f"{stamp} [{level}] [carryover] {message}", file=sys.stderr, flush=True)
+    print(f"{stamp} [{level}] [carryover] {message}", flush=True)
 
 
 def estimate_tokens(value: object) -> int:
@@ -490,15 +491,15 @@ def _print_stats(stats: CarryoverStats, target_tokens: int) -> None:
 
 
 def _print_preview(candidates: Sequence[Candidate]) -> None:
-    print("\n--- would keep (in transcript order) ---", file=sys.stderr)
+    print("\n--- would keep (in transcript order) ---", flush=True)
     for candidate in candidates:
         event_type = candidate.event.get("type", "?")
         print(
             f"  [{candidate.reason:<15}] {event_type:<9} "
             f"~{candidate.token_estimate:>5}tok  {candidate.preview}",
-            file=sys.stderr,
+            flush=True,
         )
-    print("--- end preview ---\n", file=sys.stderr)
+    print("--- end preview ---\n", flush=True)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
