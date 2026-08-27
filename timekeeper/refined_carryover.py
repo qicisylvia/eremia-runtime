@@ -105,6 +105,27 @@ _CJK_RE = re.compile(
 )
 
 
+# --- Companion-native extraction ---------------------------------------------
+# In this runtime the real 瓷瓷 <-> Eremia dialogue does NOT live in plain
+# assistant/user text. 瓷瓷's messages arrive wrapped as
+#   <channel source="companion" ... user="human" ts="...">她的话</channel>
+# and Eremia's real replies are the ``text`` argument of an
+# ``mcp__companion__reply`` tool_use. The visible assistant text is filler she
+# mutters to the terminal ("等瓷瓷回复。" x167, garden self-talk), and every
+# noise line 瓷瓷 flagged -- resume preambles, /compact echoes, pasted commands
+# -- is a *plain* (non-<channel>) user string typed into the TUI or injected by
+# Claude Code. So the discriminator is clean: keep <channel user="human">
+# messages and companion reply text; drop everything else. This diverges from
+# LMC-5's generic "keep text, drop tools", which would keep the filler and throw
+# away Eremia's actual voice.
+CHANNEL_RE = re.compile(r"^<channel\b([^>]*)>(.*)</channel>\s*$", re.S)
+CHANNEL_HUMAN_RE = re.compile(r"""\buser\s*=\s*['"]human['"]""")
+# A leading "[时间] ..." context line is prepended to some messages; strip just
+# that line (keep the real message after it). Distinct from "[时间唤醒 ...]",
+# which AUTOMATED_PREFIX_RE rejects wholesale.
+TIME_CONTEXT_RE = re.compile(r"^\s*\[时间\][^\n]*\n")
+
+
 def log(level: str, message: str) -> None:
     # stdout, matching timekeeper.log(), so an interactive dry-run in the prism
     # terminal (which surfaces stdout) actually shows its report and errors.
@@ -241,6 +262,90 @@ def sanitize_event(event: dict, max_chars: int) -> Optional[dict]:
         message["content"] = text
     clean["message"] = message
     return clean
+
+
+def _is_companion_reply(name: object) -> bool:
+    lowered = str(name).lower()
+    return "companion" in lowered and "reply" in lowered
+
+
+def _reshape(template: dict, role: str, text: str) -> dict:
+    """A plain-text dialogue event carrying ``text``, built from a raw event so
+    resume-relevant fields (timestamp, cwd, flags) survive; uuid/session/parent
+    are re-derived later by ``rewrite_session``."""
+    event = copy.deepcopy(template)
+    event["type"] = role
+    event["message"] = {"role": role, "content": text}
+    for key in (
+        "requestId", "isApiErrorMessage", "error", "durationMs",
+        "usage", "costUSD", "toolUseResult",
+    ):
+        event.pop(key, None)
+    return event
+
+
+def normalize_events(raw: Sequence[dict]) -> list[dict]:
+    """Reconstruct the pure 瓷瓷 <-> Eremia dialogue from companion round-trips.
+
+    Keeps only two things, as plain-text events:
+      - 瓷瓷's messages: ``user`` events whose content is a
+        ``<channel ... user="human">`` wrapper (inner text extracted; a leading
+        ``[时间]`` context line trimmed; automated ``[时间唤醒]`` / ``[论坛唤醒]``
+        / ``[系统]`` messages rejected).
+      - Eremia's replies: ``assistant`` events carrying an
+        ``mcp__companion__reply`` tool_use (its ``input.text`` extracted).
+
+    Everything else is dropped: the "等瓷瓷回复。" filler and garden self-talk
+    (assistant text with no reply tool), thinking blocks, tool_result turns,
+    and every plain (non-<channel>) user string -- resume preambles, /compact
+    echoes, and commands pasted into the TUI.
+    """
+    normalized: list[dict] = []
+    for event in raw:
+        event_type = event.get("type")
+        if event_type not in KEEP_TYPES:
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+
+        if event_type == "user":
+            if not isinstance(content, str):
+                continue  # tool_result and structured user turns carry no words
+            match = CHANNEL_RE.match(content.strip())
+            if match is None:
+                continue  # plain TUI/system string: preamble, echo, pasted cmd
+            attrs, inner = match.group(1), match.group(2)
+            if not CHANNEL_HUMAN_RE.search(attrs):
+                continue  # only 瓷瓷's own channel messages
+            inner = TIME_CONTEXT_RE.sub("", inner, count=1).strip()
+            if not inner:
+                continue
+            if AUTOMATED_PREFIX_RE.search(inner) or INJECTION_BLOCK_RE.search(inner):
+                continue  # a wake/system message that rode the same channel
+            normalized.append(_reshape(event, "user", inner))
+            continue
+
+        # assistant: her real words are the companion reply tool_use text only
+        if not isinstance(content, list):
+            continue
+        reply_text: Optional[str] = None
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and _is_companion_reply(block.get("name"))
+            ):
+                candidate = block.get("input")
+                text = candidate.get("text") if isinstance(candidate, dict) else None
+                if isinstance(text, str) and text.strip():
+                    reply_text = text.strip()
+                    break
+        if reply_text is None:
+            continue  # filler / self-talk / thinking, not addressed to 瓷瓷
+        normalized.append(_reshape(event, "assistant", reply_text))
+    return normalized
 
 
 def is_dialogue_event(event: dict) -> bool:
@@ -463,9 +568,13 @@ def build_refined_transcript(
     tail_events: int,
     max_event_chars: int,
 ) -> tuple[Optional[str], Optional[list[dict]], CarryoverStats]:
-    """Selection + rewrite, no disk I/O. Returns (new_session_id, jsonl, stats)."""
+    """Selection + rewrite, no disk I/O. Returns (new_session_id, jsonl, stats).
+
+    ``events`` are raw transcript events; the companion dialogue is
+    reconstructed first, then scored and budgeted.
+    """
     candidates, stats = select_refined_events(
-        events,
+        normalize_events(events),
         target_tokens=target_tokens,
         tail_events=tail_events,
         max_event_chars=max_event_chars,
@@ -561,8 +670,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("ERROR", "source transcript has no parseable events")
         return 1
 
+    dialogue = normalize_events(events)
+    log(
+        "INFO",
+        f"reconstructed {len(dialogue)} 瓷瓷<->Eremia dialogue turns "
+        f"from {len(events)} raw events",
+    )
     candidates, stats = select_refined_events(
-        events,
+        dialogue,
         target_tokens=args.target_tokens,
         tail_events=args.tail_events,
         max_event_chars=args.max_event_chars,
