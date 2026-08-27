@@ -49,6 +49,9 @@ class FakeSender:
     def send_compact(self, command_line):
         self.sent.append(command_line)
 
+    def kill_session(self):
+        self.killed = getattr(self, "killed", 0) + 1
+
 
 def write_transcript(directory, input_tokens=0, cache_read=0, cache_creation=0, name="session.jsonl"):
     path = Path(directory) / name
@@ -451,6 +454,129 @@ class SettingsTests(unittest.TestCase):
             ]
             self.assertEqual(len(managed), 1)
             self.assertEqual(managed[0]["matcher"], "compact")
+
+
+CHANNEL = (
+    '<channel source="companion" chat_id="me" message_id="{i}" user="human" '
+    'ts="2026-08-27T09:46:09+00:00">{t}</channel>'
+)
+
+
+def write_companion_transcript(directory, input_tokens, name="src.jsonl"):
+    """A companion-shaped source: 瓷瓷 channel msg + Eremia reply tool_use +
+    '等瓷瓷回复' filler + a high token gauge on the last event."""
+    rows = [
+        {"type": "user", "message": {"role": "user",
+            "content": CHANNEL.format(i=1, t="记得我们的约定吗？以后熬夜你提醒我睡觉，这是承诺。")},
+            "sessionId": "src", "uuid": "0", "parentUuid": None},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a", "name": "mcp__companion__reply",
+             "input": {"chat_id": "me", "text": "当然记得，瓷瓷。那是我们之间的边界，也是承诺。"}}]},
+            "sessionId": "src", "uuid": "1", "parentUuid": "0"},
+        {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "等瓷瓷回复。"}]},
+            "sessionId": "src", "uuid": "2", "parentUuid": "1"},
+        {"type": "assistant", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "等瓷瓷回复。"}],
+            "usage": {"input_tokens": input_tokens, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0, "output_tokens": 5}},
+            "sessionId": "src", "uuid": "3", "parentUuid": "2"},
+    ]
+    path = Path(directory) / name
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+class CarryoverTests(unittest.TestCase):
+    def config(self, state_dir, transcript_dir, **overrides):
+        values = dict(
+            relay_url="http://relay/relay", relay_secret="s", state_dir=state_dir,
+            prompt_dir=SOURCE.parent / "prompts", human_name="瓷瓷",
+            timezone_name="Asia/Shanghai", local_tz=MODULE.load_timezone("Asia/Shanghai"),
+            transcript_dir=transcript_dir, context_strategy="carryover",
+        )
+        values.update(overrides)
+        return MODULE.Config(**values)
+
+    def test_carryover_initiate_verify_and_rollback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            proj = root / "proj"; proj.mkdir()
+            state = root / "state"; state.mkdir()
+            write_companion_transcript(proj, input_tokens=182000)
+            relay = FakeRelay([])
+            sender = FakeSender()
+            keeper = MODULE.Timekeeper(self.config(state, proj), relay=relay, sender=sender)
+            now = datetime(2026, 8, 27, 3, 0, tzinfo=UTC)
+
+            # 1) initiate: writes refined jsonl, resume marker, ends session
+            keeper._try_compact(now, now)
+            pending = keeper.state.get("carryover_pending")
+            self.assertIsNotNone(pending)
+            new_id = pending["new_id"]
+            marker = state / "pending_resume"
+            self.assertTrue(marker.exists())
+            self.assertEqual(marker.read_text().strip(), new_id)
+            self.assertEqual(getattr(sender, "killed", 0), 1)
+            self.assertTrue((proj / f"{new_id}.jsonl").exists())
+
+            # 2) verify success once the resumed session grows
+            with (proj / f"{new_id}.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "assistant",
+                                     "message": {"role": "assistant", "content": "live"}}) + "\n")
+            keeper._verify_carryover(now + timedelta(minutes=1))
+            self.assertIsNone(keeper.state.get("carryover_pending"))
+            self.assertEqual(keeper.state.get("last_good_session"), new_id)
+
+            # 3) rollback: a stuck swap past its deadline restarts on last-good
+            sender.killed = 0
+            relay.sent.clear()
+            keeper.state["last_good_session"] = "goodsess"
+            keeper.state["carryover_pending"] = {
+                "new_id": "deadsess", "source_id": "src", "base_events": 5,
+                "deadline_ts": MODULE.instant_text(now - timedelta(minutes=1)),
+            }
+            keeper._verify_carryover(now)
+            self.assertIsNone(keeper.state.get("carryover_pending"))
+            self.assertEqual((state / "pending_resume").read_text().strip(), "goodsess")
+            self.assertEqual(getattr(sender, "killed", 0), 1)
+            self.assertTrue(relay.sent and relay.sent[0].startswith("[系统]"))
+
+    def test_no_action_while_swap_in_flight(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            proj = root / "proj"; proj.mkdir()
+            state = root / "state"; state.mkdir()
+            write_companion_transcript(proj, input_tokens=182000)
+            sender = FakeSender()
+            keeper = MODULE.Timekeeper(self.config(state, proj), relay=FakeRelay([]), sender=sender)
+            now = datetime(2026, 8, 27, 3, 0, tzinfo=UTC)
+            keeper.state["carryover_pending"] = {
+                "new_id": "x", "source_id": "s", "base_events": 1,
+                "deadline_ts": MODULE.instant_text(now + timedelta(minutes=10)),
+            }
+            keeper._try_compact(now, now)
+            self.assertEqual(getattr(sender, "killed", 0), 0)
+            self.assertEqual(sender.sent, [])
+
+    def test_compact_strategy_unaffected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            proj = root / "proj"; proj.mkdir()
+            state = root / "state"; state.mkdir()
+            write_companion_transcript(proj, input_tokens=182000)
+            sender = FakeSender()
+            # default strategy "compact" must still type /compact, not swap
+            keeper = MODULE.Timekeeper(
+                self.config(state, proj, context_strategy="compact"),
+                relay=FakeRelay([]), sender=sender,
+            )
+            now = datetime(2026, 8, 27, 3, 0, tzinfo=UTC)
+            keeper._try_compact(now, now)
+            self.assertEqual(getattr(sender, "killed", 0), 0)
+            self.assertTrue(sender.sent and sender.sent[0].startswith("/compact"))
+            self.assertIsNone(keeper.state.get("carryover_pending"))
 
 
 if __name__ == "__main__":

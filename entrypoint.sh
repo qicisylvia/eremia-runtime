@@ -106,9 +106,19 @@ fi
 
 # ---- Eremia 本体：tmux 里的 claude，会话死了看门狗拉起 ----
 start_claude() {
-  # 先试 --continue 接回上一段对话（重启不失忆）；首次没有历史时回退到全新会话
-  tmux new-session -d -s eremia -c "$EREMIA_HOME" \
-    "claude --continue $CLAUDE_FLAGS || claude $CLAUDE_FLAGS"
+  # 精炼续窗（timekeeper carryover 策略）会写一个 pending_resume，指定要 --resume 的新会话；
+  # 有它就优先 resume 进那段精炼会话，失败回退 --continue、再回退全新，保证一定能起来。
+  local pending="${TIMEKEEPER_STATE_DIR:-/data/timekeeper}/pending_resume"
+  local launch="claude --continue $CLAUDE_FLAGS || claude $CLAUDE_FLAGS"
+  if [ -f "$pending" ]; then
+    local rid; rid="$(tr -d '[:space:]' < "$pending" 2>/dev/null)"
+    rm -f "$pending"
+    if [ -n "$rid" ]; then
+      echo "[entrypoint] resuming refined session $rid"
+      launch="claude $CLAUDE_FLAGS --resume $rid || claude --continue $CLAUDE_FLAGS || claude $CLAUDE_FLAGS"
+    fi
+  fi
+  tmux new-session -d -s eremia -c "$EREMIA_HOME" "$launch"
   # 首次启动的信任目录/DevChannels 确认框兜底：空闲时多按的回车无害
   ( for _ in 1 2 3 4 5 6; do sleep 5; tmux send-keys -t eremia Enter 2>/dev/null || break; done ) &
 }

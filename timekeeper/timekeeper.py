@@ -21,6 +21,14 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# Sibling module for the "carryover" context strategy. Guarded so timekeeper
+# still imports (compact strategy only) if it is somehow absent.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import refined_carryover
+except Exception:  # pragma: no cover - defensive: carryover simply unavailable
+    refined_carryover = None
+
 
 STATE_VERSION = 2
 MANAGED_BEGIN = "<!-- BEGIN EREMIA TIMEKEEPER (managed) -->"
@@ -170,6 +178,15 @@ class Config:
     context_window_tokens: int = 200_000
     transcript_dir: Path = Path("/data/home/.claude/projects/-data-home-eremia-home")
     tmux_session: str = "eremia"
+    # Context-relief strategy at the soft/hard thresholds:
+    #   "compact"  -> type a warm /compact into the TUI (default; unchanged behaviour)
+    #   "carryover"-> refined session carryover: rebuild a fresh session from the
+    #                 verbatim 瓷瓷<->Eremia dialogue and resume into it
+    context_strategy: str = "compact"
+    carryover_target_tokens: int = 50_000
+    carryover_tail_events: int = 14
+    carryover_max_event_chars: int = 3_600
+    carryover_verify_minutes: int = 10
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -197,6 +214,9 @@ class Config:
         compact_hard = env_float("TIMEKEEPER_COMPACT_HARD_PERCENT", 88, 10, 100)
         if compact_hard < compact_soft:
             raise ValueError("compact hard percent must be >= soft percent")
+        strategy = os.environ.get("TIMEKEEPER_CONTEXT_STRATEGY", "compact").strip().lower()
+        if strategy not in {"compact", "carryover"}:
+            raise ValueError("TIMEKEEPER_CONTEXT_STRATEGY must be 'compact' or 'carryover'")
         default_transcript = "/data/home/.claude/projects/-data-home-eremia-home"
         return cls(
             relay_url=relay_url,
@@ -232,6 +252,15 @@ class Config:
                 os.environ.get("EREMIA_TRANSCRIPT_DIR", default_transcript)
             ),
             tmux_session=os.environ.get("EREMIA_TMUX_SESSION", "eremia").strip() or "eremia",
+            context_strategy=strategy,
+            carryover_target_tokens=env_int(
+                "EREMIA_CARRYOVER_TARGET_TOKENS", 50_000, 5_000, 500_000
+            ),
+            carryover_tail_events=env_int("EREMIA_CARRYOVER_TAIL_EVENTS", 14, 2, 200),
+            carryover_max_event_chars=env_int(
+                "EREMIA_CARRYOVER_MAX_EVENT_CHARS", 3_600, 500, 40_000
+            ),
+            carryover_verify_minutes=env_int("EREMIA_CARRYOVER_VERIFY_MINUTES", 10, 2, 120),
         )
 
 
@@ -246,6 +275,9 @@ def default_state() -> dict[str, Any]:
         "night_last_date": None,
         "last_compact_ts": None,
         "last_compact_tokens": 0,
+        # Carryover strategy bookkeeping (unused under the default compact strategy).
+        "last_good_session": None,
+        "carryover_pending": None,
     }
 
 
@@ -429,6 +461,19 @@ class TmuxSender:
             timeout=10,
         )
 
+    def kill_session(self) -> None:
+        """End the tmux session so entrypoint's watchdog restarts Claude Code.
+
+        Used by the carryover strategy: after the refined transcript and its
+        ``pending_resume`` marker are written, killing the session lets the
+        watchdog relaunch straight into the new session (with the channel flag).
+        """
+        subprocess.run(
+            ["tmux", "kill-session", "-t", self.session],
+            check=True,
+            timeout=10,
+        )
+
 
 class Timekeeper:
     def __init__(
@@ -592,19 +637,25 @@ class Timekeeper:
         return " ".join(body.split())
 
     def _try_compact(self, now: datetime, last_human: datetime | None) -> None:
-        """Pre-empt Claude Code's cold auto-compaction with a warm, instructed one.
+        """Pre-empt Claude Code's cold auto-compaction as the context fills.
 
-        Fires when the context is filling, at a moment that will not interrupt
-        an active turn:
+        Fires at a moment that will not interrupt an active turn:
           - at/above the soft threshold, only once the human has been quiet for
             ``compact_min_idle_minutes`` (a natural lull);
           - at/above the hard threshold, regardless of that lull, because the
             automatic cold summary is now imminent — but never while a turn is
             visibly generating.
-        Crash-safe like the check-in path: the attempt is reserved (cooldown +
-        token fingerprint) before delivery, so a failure never tight-loops.
+        The reserve-before-acting order makes it crash-safe like the check-in
+        path, so a failure never tight-loops. What it *delivers* depends on the
+        configured strategy: a warm ``/compact`` (default) or refined session
+        carryover, with carryover falling back to ``/compact`` if it cannot build
+        a clean session this cycle.
         """
         if not self.config.compact_enabled:
+            return
+        # A carryover swap is mid-flight (session restarting); don't stack
+        # another relief action on top — the verify step will resolve it.
+        if self.state.get("carryover_pending"):
             return
         tokens = latest_context_tokens(self.config.transcript_dir)
         if tokens is None:
@@ -637,11 +688,22 @@ class Timekeeper:
             log("INFO", f"compaction deferred at {percent:.0f}%: session is generating")
             return
 
-        # Reserve before sending so a delivery failure cannot retry until the
-        # cooldown elapses and the context has genuinely moved on.
+        # Reserve before acting so a failure cannot retry until the cooldown
+        # elapses and the context has genuinely moved on.
         self.state["last_compact_ts"] = instant_text(now)
         self.state["last_compact_tokens"] = tokens
         self._save_state()
+
+        if self._carryover_active():
+            if self._deliver_carryover(now, tokens, percent, hard):
+                return
+            # Carryover refused/failed to build a clean session this cycle; fall
+            # back to /compact so the context is still relieved before the
+            # model-level auto-compaction fires.
+            log("INFO", "carryover unavailable this cycle; falling back to /compact")
+        self._deliver_compact(now, tokens, percent, hard)
+
+    def _deliver_compact(self, now: datetime, tokens: int, percent: float, hard: bool) -> None:
         local_now = now.astimezone(self.config.local_tz)
         command_line = f"/compact {self._compact_instruction(local_now)}"
         try:
@@ -659,11 +721,164 @@ class Timekeeper:
             f"compaction requested at {percent:.0f}% ({threshold} threshold, {tokens} tokens)",
         )
 
+    # ---- refined session carryover ----------------------------------------
+
+    def _carryover_active(self) -> bool:
+        return (
+            self.config.context_strategy == "carryover"
+            and refined_carryover is not None
+            and not self.state.get("carryover_pending")
+        )
+
+    def _pending_resume_path(self) -> Path:
+        return self.config.state_dir / "pending_resume"
+
+    def _write_pending_resume(self, session_id: str) -> None:
+        """Tell entrypoint's start_claude which session to ``--resume`` into."""
+        path = self._pending_resume_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        temporary.write_text(session_id + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+
+    def _transcript_line_count(self, session_id: str) -> int | None:
+        path = self.config.transcript_dir / f"{session_id}.jsonl"
+        try:
+            with path.open(encoding="utf-8", errors="ignore") as handle:
+                return sum(1 for line in handle if line.strip())
+        except OSError:
+            return None
+
+    def _deliver_carryover(
+        self, now: datetime, tokens: int, percent: float, hard: bool
+    ) -> bool:
+        """Rebuild a fresh session from the verbatim dialogue and resume into it.
+
+        Returns True once a swap has been initiated (transcript written, resume
+        marker set, session ended for the watchdog to relaunch). Returns False if
+        no clean session could be built, so the caller falls back to /compact.
+        """
+        if refined_carryover is None:
+            return False
+        source = refined_carryover.resolve_source(self.config.transcript_dir, None, None)
+        if source is None:
+            log("ERROR", "carryover: no source transcript found")
+            return False
+        try:
+            events = refined_carryover.load_jsonl(source)
+            new_id, jsonl, stats = refined_carryover.build_refined_transcript(
+                events,
+                target_tokens=self.config.carryover_target_tokens,
+                tail_events=self.config.carryover_tail_events,
+                max_event_chars=self.config.carryover_max_event_chars,
+            )
+        except Exception as exc:
+            log("ERROR", f"carryover build failed: {type(exc).__name__}: {exc}")
+            return False
+        if stats.poison_score >= 2:
+            log(
+                "WARN",
+                f"carryover refused (poison={stats.poison_score}); a fresh window "
+                "from durable memory is safer than carrying this context",
+            )
+            return False
+        if not new_id or not jsonl:
+            log("WARN", "carryover produced no clean dialogue to carry")
+            return False
+
+        source_id = source.stem
+        out_path = self.config.transcript_dir / f"{new_id}.jsonl"
+        try:
+            refined_carryover.write_jsonl(out_path, jsonl)
+        except OSError as exc:
+            log("ERROR", f"carryover write failed: {exc}")
+            return False
+
+        if not self.state.get("last_good_session"):
+            self.state["last_good_session"] = source_id
+        deadline = now + timedelta(minutes=self.config.carryover_verify_minutes)
+        self.state["carryover_pending"] = {
+            "new_id": new_id,
+            "source_id": source_id,
+            "base_events": len(jsonl),
+            "deadline_ts": instant_text(deadline),
+        }
+        self._save_state()
+
+        try:
+            self._write_pending_resume(new_id)
+            self.sender.kill_session()
+        except Exception as exc:
+            # The marker may already be written; the verify/rollback path will
+            # recover if the restart did not take.
+            log(
+                "ERROR",
+                f"carryover restart trigger failed: {type(exc).__name__}: {exc}",
+            )
+        threshold = "hard" if hard else "soft"
+        log(
+            "INFO",
+            f"carryover initiated at {percent:.0f}% ({threshold}, {tokens} tokens): "
+            f"kept {len(jsonl)} turns (~{stats.estimated_tokens} real tokens) "
+            f"-> session {new_id}",
+        )
+        return True
+
+    def _verify_carryover(self, now: datetime) -> None:
+        """Confirm the resumed session took, else roll back to last-good.
+
+        Growth of the new session's JSONL beyond what we wrote means ``--resume``
+        loaded it and Claude Code is appending again. No growth by the deadline
+        means the resume likely failed (entrypoint fell back), so we resume the
+        last known-good session and let 瓷瓷 know.
+        """
+        pending = self.state.get("carryover_pending")
+        if not isinstance(pending, dict):
+            return
+        new_id = pending.get("new_id")
+        base = int(pending.get("base_events") or 0)
+        deadline = parse_instant(pending.get("deadline_ts"))
+        count = self._transcript_line_count(new_id) if new_id else None
+
+        if count is not None and count > base:
+            self.state["last_good_session"] = new_id
+            self.state["carryover_pending"] = None
+            self._save_state()
+            log("INFO", f"carryover verified: session {new_id} is live ({count} events)")
+            return
+
+        if deadline is not None and now < deadline:
+            return  # still within the window; let the watchdog finish restarting
+
+        last_good = self.state.get("last_good_session") or pending.get("source_id")
+        log(
+            "ERROR",
+            f"carryover verify timed out for {new_id}; rolling back to {last_good}",
+        )
+        self.state["carryover_pending"] = None
+        self._save_state()
+        if last_good:
+            try:
+                self._write_pending_resume(last_good)
+                self.sender.kill_session()
+            except Exception as exc:
+                log("ERROR", f"carryover rollback restart failed: {type(exc).__name__}: {exc}")
+        try:
+            self.relay.send_wake(
+                "[系统] 续窗这次没接住，已回滚到上一段可用会话。等你有空看一眼日志就好。"
+            )
+        except Exception:
+            pass
+
     def run_once(self, now: datetime | None = None) -> None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         self._sync_history()
         self._save_state()
         last_human = self._last_human()
+        # Resolve any in-flight carryover swap first (verify it took, or roll
+        # back), before considering a new relief action this tick.
+        if self.config.context_strategy == "carryover":
+            self._verify_carryover(current)
         # Compaction can be due even before the first human message (context
         # fills from wake activity too), so check it before the early return.
         self._try_compact(current, last_human)

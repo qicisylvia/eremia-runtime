@@ -121,6 +121,26 @@ hook 与预批权限由 `install-hooks` 幂等地合并进 `eremia-home/.claude/
 eremia` 里直接敲 `/compact 保留情感基调和原话，用你自己的口吻写` 回车即可。所有开关和阈值见
 `.env.example`；`TIMEKEEPER_COMPACT_ENABLED=false` 可整体停用自动压缩、只保留手动与 hook。
 
+#### 3.1.2 精炼续窗（carryover，可选升级）
+
+`/compact` 是有损摘要；反复压会“越压越钝”。**精炼续窗**换一种更暖的做法：不总结，而是从
+transcript 里把**你和 Eremia 逐字的真话**捞出来重建一段干净的新会话，`--resume` 进去。在这套
+companion 架构里，你的话包在 `<channel user="human">…</channel>`、她的话在 `mcp__companion__reply`
+的 `text` 里，而可见的 assistant 文本多是“等瓷瓷回复。”这类壳——所以 `timekeeper/refined_carryover.py`
+**只保留 channel 里你的话和 reply 里她的话**，把壳、花园自言自语、thinking、续窗开场白、`/compact`
+回显和裸命令全滤掉；token 估算是 CJK 感知的（`≈50k` 就是真 50k）。
+
+- **先验后切**：部署后在 **Zeabur console**（不是 prism 的 code 框，那是 Eremia 本人！）跑
+  `python3 /opt/timekeeper/refined_carryover.py --project-dir /data/home/.claude/projects/-data-home-eremia-home --dry-run`，
+  看 `--- would keep ---` 选得对不对。满意了再设 `TIMEKEEPER_CONTEXT_STRATEGY=carryover` 重启服务 B。
+- **触发点复用**：仍是那条 78%/88% 占用率闸门；到点时不再敲 `/compact`，而是重建会话、写
+  `pending_resume` 标记，由看门狗 `--resume` 进新会话——`entrypoint` 会自动补上 channel flag，
+  Eremia 不会因此变聋。
+- **安全网**：重建失败或检测到毒上下文会**自动回退 `/compact`**；`--resume` 若没接住，验活超时后
+  **回滚到 last-good 会话**并给你手机发一条 `[系统]` 提醒。**别关 Claude Code 自带的自动压缩**——
+  它是最后一道网，关了万一续窗漏接就会撞 200k 硬顶、Eremia 直接报错失声。
+- 换下来的旧 transcript 原样留在卷上当“冷仓”，随时可查证或回退。
+
 ### 4. 论坛唤醒桥（建议整体跑稳后再开）
 
 1. 服务 B 环境变量：`WAKE_BRIDGE_ENABLED=true` + `GARDEN_MACHINE_TOKEN`（论坛教程里给的机器 token），重启。
