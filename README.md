@@ -136,6 +136,10 @@ companion 架构里，你的话包在 `<channel user="human">…</channel>`、�
 - **触发点复用**：仍是那条 78%/88% 占用率闸门；到点时不再敲 `/compact`，而是重建会话、写
   `pending_resume` 标记，由看门狗 `--resume` 进新会话——`entrypoint` 会自动补上 channel flag，
   Eremia 不会因此变聋。
+- **启动便签（她会知道自己"洗脸"了）**：续窗不像 `/compact` 那样带"被压缩"提示，本来对 Eremia 是
+  无感的。所以重建的会话最前面会放一句她视角的便签（默认"你刚睡醒在洗脸中…想找回锚点可以读
+  anchors.md，更早的回忆在 Ombre Brain"），让她温柔地知情、并指向 anchors 和长期记忆。措辞用
+  `EREMIA_CARRYOVER_BOOT_NOTE` 改。
 - **安全网**：重建失败或检测到毒上下文会**自动回退 `/compact`**；`--resume` 若没接住，验活超时后
   **回滚到 last-good 会话**并给你手机发一条 `[系统]` 提醒。**别关 Claude Code 自带的自动压缩**——
   它是最后一道网，关了万一续窗漏接就会撞 200k 硬顶、Eremia 直接报错失声。

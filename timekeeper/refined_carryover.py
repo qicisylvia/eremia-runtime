@@ -45,6 +45,17 @@ from typing import Optional, Sequence
 # The runtime's channel flag; a resume without it loads Eremia deaf to Tidal.
 DEFAULT_CHANNEL_FLAG = "--dangerously-load-development-channels server:companion"
 
+# A carryover swap is otherwise invisible to Eremia -- unlike /compact, the
+# rebuilt transcript carries no "continued from a previous conversation"
+# preamble, so she would resume with no sign she was just refined. This boot
+# note leads the new session so she wakes up knowing, gently, what happened and
+# where to find her anchors. Overridable via EREMIA_CARRYOVER_BOOT_NOTE.
+DEFAULT_BOOT_NOTE = (
+    "你刚睡醒在洗脸中（上下文精炼）。下面是我们最近的对话，"
+    "想找回锚点可以读 anchors.md，更早的回忆在 Ombre Brain。"
+)
+BOOT_NOTE = os.getenv("EREMIA_CARRYOVER_BOOT_NOTE", DEFAULT_BOOT_NOTE)
+
 KEEP_TYPES = {"user", "assistant"}
 
 # Bilingual, companion-tuned. Relationship / preference / identity / boundary /
@@ -200,32 +211,32 @@ def is_injection_block(event: dict) -> bool:
     return bool(INJECTION_BLOCK_RE.search(text)) or bool(AUTOMATED_PREFIX_RE.search(text))
 
 
-def synthetic_user_prefix(template: dict) -> dict:
-    """A minimal user event, so carried history never starts on an assistant.
-
-    ``--resume`` expects the message chain to open with a user turn; when the
-    highest-signal kept event is an assistant line, this sentinel precedes it
-    without discarding it.
-    """
+def _boot_event(template: dict, note: str) -> dict:
+    """A user-role boot note, built from a real event so the new session's
+    fields (sessionId/cwd/timestamp) stay coherent."""
     prefix = copy.deepcopy(template)
     prefix["type"] = "user"
     prefix["userType"] = "external"
     prefix["isMeta"] = False
     prefix["isSidechain"] = False
-    prefix["message"] = {
-        "role": "user",
-        "content": "[refined-carryover: preserved high-signal context follows]",
-    }
+    prefix["message"] = {"role": "user", "content": note}
     for key in ("requestId", "isApiErrorMessage", "error", "durationMs", "usage", "costUSD"):
         prefix.pop(key, None)
     return prefix
 
 
-def ensure_user_first(events: Sequence[dict]) -> list[dict]:
+def prepend_boot_note(events: Sequence[dict], note: str) -> list[dict]:
+    """Lead the refined transcript with the boot note.
+
+    This both tells Eremia she was just carried over (a swap is otherwise
+    invisible to her) and guarantees the message chain opens on a user turn,
+    which ``--resume`` expects. Mirrors the user-role framing Claude Code itself
+    injects after a compaction.
+    """
     selected = list(events)
-    if not selected or selected[0].get("type") == "user":
+    if not selected or not note:
         return selected
-    return [synthetic_user_prefix(selected[0]), *selected]
+    return [_boot_event(selected[0], note), *selected]
 
 
 def compact_text(text: str, max_chars: int) -> str:
@@ -567,11 +578,13 @@ def build_refined_transcript(
     target_tokens: int,
     tail_events: int,
     max_event_chars: int,
+    boot_note: str = BOOT_NOTE,
 ) -> tuple[Optional[str], Optional[list[dict]], CarryoverStats]:
     """Selection + rewrite, no disk I/O. Returns (new_session_id, jsonl, stats).
 
     ``events`` are raw transcript events; the companion dialogue is
-    reconstructed first, then scored and budgeted.
+    reconstructed first, then scored and budgeted, and the boot note is
+    prepended so the resumed Eremia knows she was just carried over.
     """
     candidates, stats = select_refined_events(
         normalize_events(events),
@@ -581,7 +594,7 @@ def build_refined_transcript(
     )
     if not candidates:
         return None, None, stats
-    ordered = ensure_user_first([candidate.event for candidate in candidates])
+    ordered = prepend_boot_note([candidate.event for candidate in candidates], boot_note)
     new_session_id = str(uuid.uuid4())
     return new_session_id, rewrite_session(ordered, new_session_id), stats
 
@@ -644,6 +657,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="flags the resume command must carry so Eremia keeps the Tidal channel",
     )
     parser.add_argument(
+        "--boot-note",
+        default=BOOT_NOTE,
+        help="note prepended to the new session so Eremia knows she was carried over",
+    )
+    parser.add_argument(
         "--allow-poison",
         action="store_true",
         help="do not fail closed on recent AUP/policy/refusal poison",
@@ -684,6 +702,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     _print_stats(stats, args.target_tokens)
     _print_preview(candidates)
+    if args.boot_note:
+        log("INFO", f"boot note (prepended on resume): {args.boot_note}")
 
     if stats.poison_score >= 2 and not args.allow_poison:
         log(
@@ -705,7 +725,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
 
-    ordered = ensure_user_first([candidate.event for candidate in candidates])
+    ordered = prepend_boot_note([candidate.event for candidate in candidates], args.boot_note)
     new_session_id = str(uuid.uuid4())
     out_dir = args.target_dir or source.parent
     out_path = out_dir / f"{new_session_id}.jsonl"
