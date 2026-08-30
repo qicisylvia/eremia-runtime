@@ -58,6 +58,16 @@ BOOT_NOTE = os.getenv("EREMIA_CARRYOVER_BOOT_NOTE", DEFAULT_BOOT_NOTE)
 
 KEEP_TYPES = {"user", "assistant"}
 
+# Present so a rebuilt assistant entry looks native to the resume reader, zeroed
+# so timekeeper cannot mistake a carried-over reading for the refined session's
+# real occupancy and swap again on the next tick.
+ZERO_USAGE = {
+    "input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 0,
+}
+
 # Bilingual, companion-tuned. Relationship / preference / identity / boundary /
 # promise / emotional-state / continuity terms score highest.
 MEMORY_RE = re.compile(
@@ -213,15 +223,13 @@ def is_injection_block(event: dict) -> bool:
 
 def _boot_event(template: dict, note: str) -> dict:
     """A user-role boot note, built from a real event so the new session's
-    fields (sessionId/cwd/timestamp) stay coherent."""
-    prefix = copy.deepcopy(template)
-    prefix["type"] = "user"
+    fields (sessionId/cwd/timestamp) stay coherent. Routed through ``_reshape``
+    so it carries the same native on-disk shape as every other carried turn --
+    including when ``template`` happens to be an assistant event."""
+    prefix = _reshape(template, "user", note)
     prefix["userType"] = "external"
     prefix["isMeta"] = False
     prefix["isSidechain"] = False
-    prefix["message"] = {"role": "user", "content": note}
-    for key in ("requestId", "isApiErrorMessage", "error", "durationMs", "usage", "costUSD"):
-        prefix.pop(key, None)
     return prefix
 
 
@@ -283,10 +291,51 @@ def _is_companion_reply(name: object) -> bool:
 def _reshape(template: dict, role: str, text: str) -> dict:
     """A plain-text dialogue event carrying ``text``, built from a raw event so
     resume-relevant fields (timestamp, cwd, flags) survive; uuid/session/parent
-    are re-derived later by ``rewrite_session``."""
+    are re-derived later by ``rewrite_session``.
+
+    The ``message`` object must keep the exact shape Claude Code writes to disk.
+    An assistant entry needs ``id`` / ``type`` / ``model`` and a *block list*
+    content; handed a bare ``{"role", "content": str}`` the resume reader drops
+    the line, and since ``rewrite_session`` threads one parentUuid chain, a
+    dropped line snaps the chain and strands every earlier turn -- the whole
+    carried history, boot note included, silently fails to load while the file
+    itself still opens and keeps growing.
+
+    ``usage`` is zeroed rather than carried over: the field has to be present
+    for the entry to look native, but a stale value would make timekeeper's
+    ``latest_context_tokens`` read the freshly refined session as still full and
+    trigger another swap immediately.
+    """
     event = copy.deepcopy(template)
     event["type"] = role
-    event["message"] = {"role": role, "content": text}
+    message = event.get("message")
+    message = copy.deepcopy(message) if isinstance(message, dict) else {}
+    message["role"] = role
+
+    if role == "assistant":
+        message["type"] = "message"
+        message["id"] = f"msg_{uuid.uuid4().hex[:24]}"
+        message["content"] = [{"type": "text", "text": text}]
+        message["stop_reason"] = "end_turn"
+        message["stop_sequence"] = None
+        message["usage"] = dict(ZERO_USAGE)
+        # user-only envelope fields, meaningless on an assistant turn
+        for key in ("origin", "permissionMode", "promptId", "promptSource"):
+            event.pop(key, None)
+    else:
+        message["content"] = text
+        # assistant-only fields, meaningless on a user turn -- reachable when
+        # the boot note is templated off an assistant event
+        for key in (
+            "id", "type", "model", "stop_reason", "stop_sequence",
+            "usage", "diagnostics", "stop_details",
+        ):
+            message.pop(key, None)
+        event.pop("effort", None)
+        if "promptId" in event:
+            event["promptId"] = str(uuid.uuid4())  # never reuse the template's
+
+    event["message"] = message
     for key in (
         "requestId", "isApiErrorMessage", "error", "durationMs",
         "usage", "costUSD", "toolUseResult",
