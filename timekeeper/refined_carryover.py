@@ -68,6 +68,18 @@ ZERO_USAGE = {
     "output_tokens": 0,
 }
 
+# Envelope fields every Claude Code transcript entry carries. Events injected by
+# the Tidal companion channel are thinner than the ones the TUI writes -- they
+# can arrive without ``cwd`` / ``version`` / ``userType`` -- and since _reshape
+# templates off the source event, whatever the template lacks the rebuilt event
+# lacks too. So they are back-filled from the richest entry in the transcript.
+ENVELOPE_KEYS = ("cwd", "version", "gitBranch", "userType")
+
+# Channel-written events carry a snake_case ``session_id`` alongside (or instead
+# of) Claude Code's ``sessionId``. Left in place it survives ``rewrite_session``
+# untouched and keeps pointing at the dead source session.
+STALE_SESSION_KEYS = ("session_id",)
+
 # Bilingual, companion-tuned. Relationship / preference / identity / boundary /
 # promise / emotional-state / continuity terms score highest.
 MEMORY_RE = re.compile(
@@ -221,19 +233,21 @@ def is_injection_block(event: dict) -> bool:
     return bool(INJECTION_BLOCK_RE.search(text)) or bool(AUTOMATED_PREFIX_RE.search(text))
 
 
-def _boot_event(template: dict, note: str) -> dict:
+def _boot_event(template: dict, note: str, envelope: Optional[dict] = None) -> dict:
     """A user-role boot note, built from a real event so the new session's
     fields (sessionId/cwd/timestamp) stay coherent. Routed through ``_reshape``
     so it carries the same native on-disk shape as every other carried turn --
     including when ``template`` happens to be an assistant event."""
-    prefix = _reshape(template, "user", note)
+    prefix = _reshape(template, "user", note, envelope)
     prefix["userType"] = "external"
     prefix["isMeta"] = False
     prefix["isSidechain"] = False
     return prefix
 
 
-def prepend_boot_note(events: Sequence[dict], note: str) -> list[dict]:
+def prepend_boot_note(
+    events: Sequence[dict], note: str, envelope: Optional[dict] = None
+) -> list[dict]:
     """Lead the refined transcript with the boot note.
 
     This both tells Eremia she was just carried over (a swap is otherwise
@@ -244,7 +258,7 @@ def prepend_boot_note(events: Sequence[dict], note: str) -> list[dict]:
     selected = list(events)
     if not selected or not note:
         return selected
-    return [_boot_event(selected[0], note), *selected]
+    return [_boot_event(selected[0], note, envelope), *selected]
 
 
 def compact_text(text: str, max_chars: int) -> str:
@@ -288,7 +302,29 @@ def _is_companion_reply(name: object) -> bool:
     return "companion" in lowered and "reply" in lowered
 
 
-def _reshape(template: dict, role: str, text: str) -> dict:
+def session_envelope(raw: Sequence[dict]) -> dict:
+    """Harvest the transcript-wide envelope fields from the richest raw events.
+
+    Any entry Claude Code itself wrote carries ``cwd`` and ``version``; the
+    channel-injected ones may not. Scanning the whole transcript for each field
+    means one TUI-written turn anywhere is enough to back-fill every rebuilt
+    event, even when every carried turn came in over the companion channel.
+    """
+    envelope: dict = {}
+    for event in raw:
+        for key in ENVELOPE_KEYS:
+            value = event.get(key)
+            if key not in envelope and isinstance(value, str) and value:
+                envelope[key] = value
+        if len(envelope) == len(ENVELOPE_KEYS):
+            break
+    envelope.setdefault("userType", "external")
+    return envelope
+
+
+def _reshape(
+    template: dict, role: str, text: str, envelope: Optional[dict] = None
+) -> dict:
     """A plain-text dialogue event carrying ``text``, built from a raw event so
     resume-relevant fields (timestamp, cwd, flags) survive; uuid/session/parent
     are re-derived later by ``rewrite_session``.
@@ -341,6 +377,12 @@ def _reshape(template: dict, role: str, text: str) -> dict:
         "usage", "costUSD", "toolUseResult",
     ):
         event.pop(key, None)
+    for key in STALE_SESSION_KEYS:
+        event.pop(key, None)
+    for key, value in (envelope or {}).items():
+        event.setdefault(key, value)
+    event.setdefault("userType", "external")
+    event.setdefault("isSidechain", False)
     return event
 
 
@@ -360,6 +402,7 @@ def normalize_events(raw: Sequence[dict]) -> list[dict]:
     and every plain (non-<channel>) user string -- resume preambles, /compact
     echoes, and commands pasted into the TUI.
     """
+    envelope = session_envelope(raw)
     normalized: list[dict] = []
     for event in raw:
         event_type = event.get("type")
@@ -384,7 +427,7 @@ def normalize_events(raw: Sequence[dict]) -> list[dict]:
                 continue
             if AUTOMATED_PREFIX_RE.search(inner) or INJECTION_BLOCK_RE.search(inner):
                 continue  # a wake/system message that rode the same channel
-            normalized.append(_reshape(event, "user", inner))
+            normalized.append(_reshape(event, "user", inner, envelope))
             continue
 
         # assistant: her real words are the companion reply tool_use text only
@@ -404,7 +447,7 @@ def normalize_events(raw: Sequence[dict]) -> list[dict]:
                     break
         if reply_text is None:
             continue  # filler / self-talk / thinking, not addressed to 瓷瓷
-        normalized.append(_reshape(event, "assistant", reply_text))
+        normalized.append(_reshape(event, "assistant", reply_text, envelope))
     return normalized
 
 
@@ -580,6 +623,8 @@ def rewrite_session(events: Sequence[dict], new_session_id: str) -> list[dict]:
     for event in events:
         clean = copy.deepcopy(event)
         event_uuid = str(uuid.uuid4())
+        for key in STALE_SESSION_KEYS:
+            clean.pop(key, None)  # would otherwise still name the dead session
         clean["sessionId"] = new_session_id
         clean["uuid"] = event_uuid
         clean["parentUuid"] = previous_uuid
@@ -643,7 +688,9 @@ def build_refined_transcript(
     )
     if not candidates:
         return None, None, stats
-    ordered = prepend_boot_note([candidate.event for candidate in candidates], boot_note)
+    ordered = prepend_boot_note(
+        [candidate.event for candidate in candidates], boot_note, session_envelope(events)
+    )
     new_session_id = str(uuid.uuid4())
     return new_session_id, rewrite_session(ordered, new_session_id), stats
 
@@ -774,7 +821,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
 
-    ordered = prepend_boot_note([candidate.event for candidate in candidates], args.boot_note)
+    ordered = prepend_boot_note(
+        [candidate.event for candidate in candidates], args.boot_note, session_envelope(events)
+    )
     new_session_id = str(uuid.uuid4())
     out_dir = args.target_dir or source.parent
     out_path = out_dir / f"{new_session_id}.jsonl"
