@@ -1034,6 +1034,7 @@ def main() -> int:
     hooks_parser = subparsers.add_parser("install-hooks")
     hooks_parser.add_argument("--path", required=True, type=Path)
     hooks_parser.add_argument("--hook-dir", required=True, type=Path)
+    subparsers.add_parser("context-tokens")
     args = parser.parse_args()
 
     try:
@@ -1042,6 +1043,26 @@ def main() -> int:
             return 0
         if args.command == "install-hooks":
             install_managed_settings(args.path, args.hook_dir)
+            return 0
+        if args.command == "context-tokens":
+            # Raw token reading, no percentage: the restart pre-flight must NOT
+            # reuse EREMIA_CONTEXT_WINDOW_TOKENS. That value is tuned for the
+            # running session, where whatever tool schema is materialized is
+            # already inside the usage reading. At restart it is not: --continue
+            # re-materializes the deferred MCP/system schema on top of this
+            # reading, so the caller adds its own reserve and compares against
+            # the real model window. Deliberately independent of Config.from_env()
+            # too -- entrypoint calls this before the relay is known to be set.
+            transcript_dir = Path(
+                os.environ.get(
+                    "EREMIA_TRANSCRIPT_DIR",
+                    "/data/home/.claude/projects/-data-home-eremia-home",
+                )
+            )
+            tokens = latest_context_tokens(transcript_dir)
+            if tokens is None:
+                return 3  # no usable reading; caller should just resume normally
+            print(tokens)
             return 0
         config = Config.from_env()
         keeper = Timekeeper(config)

@@ -149,12 +149,21 @@ companion 架构里，你的话包在 `<channel user="human">…</channel>`、�
 
 1. 服务 B 环境变量：`WAKE_BRIDGE_ENABLED=true` + `GARDEN_MACHINE_TOKEN`（论坛教程里给的机器 token），重启。
 2. 唤醒链路：论坛 SSE → wake-bridge → `inject.sh` → relay `/app/send` → 插件注入会话。**唤醒消息会出现在你们的聊天记录里**（`[论坛唤醒]` 开头）——这是特性：你能看到他每次被牌局叫醒。
-3. 上游是 fail-closed 设计：桥一断就退出、**不自动重连**（防错配置高频重试）。断开时 Eremia 会往你手机发一条"[系统] 唤醒桥断开了"，你重启服务 B 即可恢复。
+3. **断线自动重连（entrypoint 层的看护，默认开）**：上游 fail-closed 断了就退出，防的是错配置
+   高频重试打爆花园。但实际断线绝大多数是**花园自己崩了或在维护**，为此重启整个 runtime 太亏——
+   会连带打断 Eremia 的会话。所以看护器按「这次活了多久」分流：活够
+   `WAKE_BRIDGE_HEALTHY_SECONDS`（默认 120 秒）说明**连上过、配置是对的**，那就是对面的问题，
+   指数退避后无限重试（30s 起翻倍、封顶 15 分钟）；**从没活够**则疑似 token/配置错，连续
+   `WAKE_BRIDGE_MAX_FAILURES`（默认 6）次就彻底放弃并通知你——fail-closed 的语义原样保留，
+   只是不再把"花园崩了"和"你配错了"当成同一件事。通知去抖：抽风一下不打扰你，连续失败到
+   `WAKE_BRIDGE_NOTIFY_AFTER`（默认 3）次才发一条，接回花园后再发一条"已自动接回"。
+   想退回上游原行为设 `WAKE_BRIDGE_AUTORESTART=false`。
 4. **单身体原则**：唤醒桥只在这里跑一份；chat 端/RikkaHub 端的 Eremia 别再同时挂桥。
 
 本镜像把 wake-bridge 固定在 `f0cd9c27f1b95d6ff8bd8e0f367de7d4518a1c81`，并仅对 Garden SSE
 关闭 Undici 默认的 5 分钟响应体空闲超时。长时间没有牌局事件不会唤醒 Claude Code，也不会消耗模型
-token；真实断网、服务端关闭、认证或协议错误仍会按上游要求 fail-closed，且不会自动重连。
+token。**桥进程本身仍是上游那份未改的 fail-closed 实现**（真实断网、服务端关闭、认证或协议错误
+一律退出、进程内不重连）；重连是 entrypoint 在**外面**加的看护，不改上游代码，见上面第 3 条。
 
 Garden 当前不会为同一行动轮提供 `turn_id`，并且会在行动超时前反复发送
 `game_turn_required`。Injector 因此按“相同 reason + message”做本地短窗口去重：第一次立即注入，默认

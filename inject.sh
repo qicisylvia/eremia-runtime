@@ -15,6 +15,14 @@ WAKE_GAME_TURN_REMINDER_DELAY_SECONDS="${WAKE_GAME_TURN_REMINDER_DELAY_SECONDS:-
 WAKE_GAME_TURN_MAX_DELIVERIES="${WAKE_GAME_TURN_MAX_DELIVERIES:-2}"
 WAKE_DEDUPE_STATE_DIR="${WAKE_DEDUPE_STATE_DIR:-/data/wake-bridge-dedupe}"
 
+# 落库验证的窗口。**这个数太小会把限流器整个废掉**（2026-08-24 实测炸过）：唤醒爆发时
+# relay 一秒内可能进十几条，limit=10 会把刚发的那条挤出窗口 → 明明送到了却查不到 →
+# 判定失败 → 回滚名额 + 非零退出 → Bridge 按 maxAttempts=2 重投 → 每次催办变成两条；
+# 而回滚清掉了计数，让「120 秒内最多 2 条」这道闸门永远撞不到上限。爆发越猛放大越狠，
+# 结果就是同一句催办连发七八条。窗口要留够余量，并且允许多查几次再下结论。
+WAKE_VERIFY_HISTORY_LIMIT="${WAKE_VERIFY_HISTORY_LIMIT:-50}"
+WAKE_VERIFY_ATTEMPTS="${WAKE_VERIFY_ATTEMPTS:-3}"
+
 require_positive_integer() {
   local name="$1"
   local value="$2"
@@ -27,6 +35,10 @@ require_positive_integer() {
 require_positive_integer WAKE_GAME_TURN_WINDOW_SECONDS "$WAKE_GAME_TURN_WINDOW_SECONDS"
 require_positive_integer WAKE_GAME_TURN_REMINDER_DELAY_SECONDS "$WAKE_GAME_TURN_REMINDER_DELAY_SECONDS"
 require_positive_integer WAKE_GAME_TURN_MAX_DELIVERIES "$WAKE_GAME_TURN_MAX_DELIVERIES"
+require_positive_integer WAKE_VERIFY_HISTORY_LIMIT "$WAKE_VERIFY_HISTORY_LIMIT"
+require_positive_integer WAKE_VERIFY_ATTEMPTS "$WAKE_VERIFY_ATTEMPTS"
+WAKE_VERIFY_HISTORY_LIMIT=$((10#$WAKE_VERIFY_HISTORY_LIMIT))
+WAKE_VERIFY_ATTEMPTS=$((10#$WAKE_VERIFY_ATTEMPTS))
 WAKE_GAME_TURN_WINDOW_SECONDS=$((10#$WAKE_GAME_TURN_WINDOW_SECONDS))
 WAKE_GAME_TURN_REMINDER_DELAY_SECONDS=$((10#$WAKE_GAME_TURN_REMINDER_DELAY_SECONDS))
 WAKE_GAME_TURN_MAX_DELIVERIES=$((10#$WAKE_GAME_TURN_MAX_DELIVERIES))
@@ -126,21 +138,37 @@ fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 TEXT="[论坛唤醒 $STAMP] ${REASON:-wake}：${MESSAGE:-有新动静，先 list_notifications 看看}"
 
+POST_OK=false
 DELIVERY_OK=false
 if curl -fsS -X POST "$RELAY_URL/app/send" \
     -H "Authorization: Bearer $RELAY_SECRET" \
     -H 'content-type: application/json' \
     --data "$(jq -nc --arg t "$TEXT" '{text: $t}')" >/dev/null; then
-  # 验证消息真的进了 relay（stamp 唯一，防止误匹配旧消息）
-  sleep 1
-  if curl -fsS "$RELAY_URL/app/history?limit=10" \
-      -H "Authorization: Bearer $RELAY_SECRET" | grep -qF "$STAMP"; then
-    DELIVERY_OK=true
-  fi
+  POST_OK=true
+  # 验证消息真的进了 relay（stamp 唯一，防止误匹配旧消息）。
+  # 多查几次：爆发时刚发的那条可能还没落库，一锤定音会误判成失败。
+  for _ in $(seq 1 "$WAKE_VERIFY_ATTEMPTS"); do
+    sleep 1
+    if curl -fsS "$RELAY_URL/app/history?limit=${WAKE_VERIFY_HISTORY_LIMIT}" \
+        -H "Authorization: Bearer $RELAY_SECRET" | grep -qF "$STAMP"; then
+      DELIVERY_OK=true
+      break
+    fi
+  done
 fi
 
 if [ "$DELIVERY_OK" != true ]; then
-  echo "[inject] relay delivery or verification failed" >&2
+  if [ "$POST_OK" = true ]; then
+    # POST 拿到 2xx 已经是很强的送达证据，只是没能在历史里确认。这时**必须保留名额**：
+    # 回滚会让 Bridge 的第二次投递畅通无阻，那正是重复轰炸的来源。仍以非零退出把
+    # “没确认”如实告诉 Bridge（保留 fail-closed 语义），但它的重投会被限流器挡掉。
+    DEDUPE_RESERVED=false
+    trap - EXIT
+    echo "[inject] relay POST ok but unconfirmed in history; keeping dedupe slot (no rollback)" >&2
+    exit 1
+  fi
+  # POST 本身就被拒 = 确实没送到，回滚名额让 Bridge 安全重试才是对的。
+  echo "[inject] relay delivery failed (POST rejected); rolling back dedupe slot" >&2
   exit 1
 fi
 

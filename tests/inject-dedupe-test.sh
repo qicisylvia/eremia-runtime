@@ -54,6 +54,10 @@ if [ "$method" = "POST" ]; then
   printf '%s\n' "$data" > "$FAKE_HISTORY_FILE"
   printf 'delivery\n' >> "$FAKE_DELIVERY_LOG"
 else
+  # FAKE_HIDE_HISTORY_FILE 模拟"消息确实送到了，但爆发时被挤出了 history 窗口"。
+  # 注意旧版这里没有这个开关，GET 永远能查到刚 POST 的内容，所以验证永远成功——
+  # 这就是 limit=10 那个真实 bug 从未被测出来的原因。
+  [ ! -f "$FAKE_HIDE_HISTORY_FILE" ] || exit 0
   cat "$FAKE_HISTORY_FILE" 2>/dev/null || true
 fi
 EOF
@@ -86,6 +90,7 @@ export FAKE_NOW_FILE="$TEST_ROOT/now"
 export FAKE_HISTORY_FILE="$TEST_ROOT/history"
 export FAKE_DELIVERY_LOG="$TEST_ROOT/deliveries"
 export FAKE_FAIL_FILE="$TEST_ROOT/fail-post"
+export FAKE_HIDE_HISTORY_FILE="$TEST_ROOT/hide-history"
 
 set_now() {
   printf '%s\n' "$1" > "$FAKE_NOW_FILE"
@@ -148,5 +153,28 @@ set_now 1124
 set_now 1125
 "$INJECTOR" forum_notification_available "论坛通知 A" </dev/null
 assert_deliveries 7
+
+# 回归用例：POST 成功、但历史里查不到（爆发时被挤出 limit 窗口）。
+# 2026-08-24 的七八条轰炸就是这么来的：旧代码把"查不到"当成"没送到"，回滚了去重名额，
+# Bridge 按 maxAttempts=2 立刻重投 → 每次催办变成两条；而回滚清掉计数，
+# 又让「120 秒内最多 2 条」永远撞不到上限，于是四次催办 = 八条。
+# 正确行为：POST 成功就保留名额，非零退出照旧（fail-closed），但重投必须被限流器挡掉。
+set_now 2000
+touch "$FAKE_HIDE_HISTORY_FILE"
+BEFORE="$(delivery_count)"
+if invoke_game "被挤出窗口的行动。"; then
+  echo "expected non-zero exit when history confirmation fails" >&2
+  exit 1
+fi
+assert_deliveries "$((BEFORE + 1))"
+
+# Bridge 的第二次投递（retryDelayMs=500，仍在同一秒）：必须被抑制，不能再送一条。
+set_now 2000
+if ! invoke_game "被挤出窗口的行动。"; then
+  echo "expected Bridge retry to be suppressed (exit 0), not delivered again" >&2
+  exit 1
+fi
+assert_deliveries "$((BEFORE + 1))"
+rm -f "$FAKE_HIDE_HISTORY_FILE"
 
 echo "inject dedupe test passed"

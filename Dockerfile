@@ -7,7 +7,11 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
       git ca-certificates curl unzip ripgrep procps tmux tini bash jq coreutils tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+# 锁版本 + 关自动更新。不锁的话每次重建都会拉当时最新版；而且 claude-code 还会在运行中
+# 自己把二进制换掉（2026-09-05 实测：容器 11:48 起，12:19 就地自升到 2.1.261）。引擎在
+# Eremia 脚下静默变更 = 压缩/续窗行为无预警改变。要升级就显式改这一行，别让它自己来。
+ENV DISABLE_AUTOUPDATER=1
+RUN npm install -g @anthropic-ai/claude-code@2.1.261
 
 # Bun：Tidal Echo channel 插件的运行时
 RUN curl -fsSL https://bun.sh/install | bash \
