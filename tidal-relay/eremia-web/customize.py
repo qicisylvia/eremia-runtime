@@ -79,9 +79,24 @@ function openStream(){
     )
 
 
+def assert_secret_key(text: str) -> None:
+    """The overlay reads the relay credential from this exact localStorage key.
+
+    Upstream stores it as ``localStorage.getItem(LS_KEY)``, and the voice overlay
+    has to read the same key to authenticate /tts. If upstream ever renames it,
+    fail the build here -- the alternative is Eremia's voice answering 401 in
+    production for a reason nobody can see from the outside.
+    """
+    if not re.search(r'LS_KEY\s*=\s*"companion_secret"', text):
+        raise RuntimeError(
+            "upstream renamed LS_KEY; update SECRET_STORAGE_KEY in eremia.js to match"
+        )
+
+
 def customize_index(bundle: Path, web: Path) -> None:
     path = web / "index.html"
     text = path.read_text(encoding="utf-8")
+    assert_secret_key(text)
     replacements = [
         ("<title>Tidal Echo</title>", "<title>Eremia&amp;QiCi</title>", "document title"),
         ('content="#F4F4F5"', 'content="#151A13"', "theme color"),
@@ -166,7 +181,7 @@ def customize_worker(web: Path) -> None:
     path = web / "sw.js"
     text = path.read_text(encoding="utf-8")
     text, ai_count = re.subn(r'^const AI_NAME = ".*?";', f'const AI_NAME = "{AI_NAME}";', text, count=1, flags=re.M)
-    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v6";', text, count=1, flags=re.M)
+    text, cache_count = re.subn(r'^const CACHE = ".*?";', 'const CACHE = "eremia-hinoki-v7";', text, count=1, flags=re.M)
     if ai_count != 1 or cache_count != 1:
         raise RuntimeError("service worker identity/cache markers changed upstream")
     text = replace_once(

@@ -68,8 +68,23 @@ document.addEventListener("visibilitychange", () => {
         assert 'document.visibilityState !== "visible" || !secret' not in index_text
         assert index_text.count("suspendHiddenStream();") == 2
         assert index_text.rstrip().endswith("});")
-        assert 'const CACHE = "eremia-hinoki-v6";' in worker_text
+        assert 'const CACHE = "eremia-hinoki-v7";' in worker_text
         assert worker_text.count('"./icon-192.webp"') == 3
+
+        # 朗读覆盖层从 localStorage 的 companion_secret 取凭证认证 /tts。
+        # 上游改了这个键名必须在构建时就炸，而不是让语音在线上静默 401。
+        customizer.assert_secret_key('const LS_KEY    = "companion_secret";')
+        for drifted in (
+            'const LS_KEY = "companion_token";',
+            'const LS_KEY = LEGACY_KEY;',
+            'no key here at all',
+        ):
+            try:
+                customizer.assert_secret_key(drifted)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"LS_KEY drift not caught: {drifted}")
 
     print("push customization tests passed")
 

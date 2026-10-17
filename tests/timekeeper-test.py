@@ -76,6 +76,47 @@ def write_transcript(directory, input_tokens=0, cache_read=0, cache_creation=0, 
     return path
 
 
+def append_entries(path, *entries):
+    with Path(path).open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+    return Path(path)
+
+
+def api_error(text):
+    """An assistant turn Claude Code wrote for a failed request: usage all zero."""
+    return {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "usage": {
+                "input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }
+
+
+def sidechain_turn(tokens):
+    return {
+        "type": "assistant",
+        "isSidechain": True,
+        "message": {
+            "role": "assistant",
+            "usage": {
+                "input_tokens": tokens,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": 10,
+            },
+        },
+    }
+
+
 class TimekeeperTests(unittest.TestCase):
     def config(self, state_dir: Path, **overrides):
         values = dict(
@@ -282,6 +323,65 @@ class ContextTokenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             self.assertIsNone(MODULE.latest_context_tokens(temp_dir))
 
+    def test_api_error_turn_does_not_read_as_an_empty_window(self):
+        # 2026-10-17: "Prompt is too long" writes an all-zero usage block. Reading
+        # it as 0 tokens pinned the watcher at 0% and disabled all relief.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_transcript(temp_dir, input_tokens=3, cache_read=176626)
+            append_entries(path, api_error("Prompt is too long"))
+            reading = MODULE.read_context(temp_dir)
+            self.assertEqual(reading.tokens, 176629)
+            self.assertTrue(reading.overflow)
+            self.assertFalse(reading.auth_expired)
+
+    def test_expired_login_is_reported_not_measured(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_transcript(temp_dir, input_tokens=3, cache_read=150000)
+            append_entries(path, api_error("Login expired · Please run /login"))
+            reading = MODULE.read_context(temp_dir)
+            self.assertEqual(reading.tokens, 150003)
+            self.assertTrue(reading.auth_expired)
+            self.assertFalse(reading.overflow)
+
+    def test_zeroed_usage_from_a_refined_transcript_is_not_a_reading(self):
+        # refined_carryover writes ZERO_USAGE into every carried event.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_transcript(temp_dir, input_tokens=0)
+            self.assertIsNone(MODULE.latest_context_tokens(temp_dir))
+            append_entries(
+                path,
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "usage": {"input_tokens": 5, "cache_read_input_tokens": 60000},
+                    },
+                },
+            )
+            self.assertEqual(MODULE.latest_context_tokens(temp_dir), 60005)
+
+    def test_subagent_turn_is_skipped_for_the_main_window_reading(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_transcript(temp_dir, input_tokens=3, cache_read=160000)
+            append_entries(path, sidechain_turn(12000))
+            self.assertEqual(MODULE.latest_context_tokens(temp_dir), 160003)
+
+    def test_tail_read_finds_the_reading_in_a_long_transcript(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_transcript(temp_dir, input_tokens=1000)
+            append_entries(path, *[{"type": "user", "message": {"role": "user", "content": "x" * 200}} for _ in range(400)])
+            append_entries(
+                path,
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "usage": {"input_tokens": 7, "cache_read_input_tokens": 99000},
+                    },
+                },
+            )
+            self.assertEqual(MODULE.latest_context_tokens(temp_dir), 99007)
+
 
 class CompactionTests(unittest.TestCase):
     def config(self, state_dir: Path, transcript_dir: Path, **overrides):
@@ -345,13 +445,35 @@ class CompactionTests(unittest.TestCase):
             keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
             self.assertEqual(len(sender.sent), 1)
 
-    def test_never_interrupts_a_generating_turn(self):
+    def test_never_interrupts_a_generating_turn_below_the_ceiling(self):
         with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
-            write_transcript(tx, input_tokens=95000)  # 95%, above hard
+            write_transcript(tx, input_tokens=90000)  # 90%: above hard, under the ceiling
             sender = FakeSender(busy=True)
             keeper = self.keeper(Path(state), Path(tx), sender)
             keeper._try_compact(datetime(2026, 8, 25, 13, 0, tzinfo=UTC), None)
             self.assertEqual(sender.sent, [])
+
+    def test_a_generating_turn_stops_protecting_the_session_at_the_ceiling(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=97000)  # 97%, past the 94% ceiling
+            sender = FakeSender(busy=True)
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(datetime(2026, 10, 17, 11, 38, tzinfo=UTC), None)
+            self.assertEqual(len(sender.sent), 1)
+
+    def test_the_whole_2026_10_17_sequence_relieves_instead_of_wedging(self):
+        # 瓷瓷 and Eremia talking at 97-98%: every tick saw a generating turn, so
+        # every tick deferred, until the window hit the wall.
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            path = write_transcript(tx, input_tokens=3, cache_read=97400)  # 97.4%
+            sender = FakeSender(busy=True)
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(datetime(2026, 10, 17, 11, 36, tzinfo=UTC), None)
+            self.assertEqual(len(sender.sent), 1)  # relieved before the wall
+            # And if it had been missed, the overflow error still forces a rescue.
+            append_entries(path, api_error("Prompt is too long"))
+            keeper._try_compact(datetime(2026, 10, 17, 12, 40, tzinfo=UTC), None)
+            self.assertEqual(len(sender.sent), 2)
 
     def test_disabled_watcher_is_silent(self):
         with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
@@ -383,6 +505,79 @@ class CompactionTests(unittest.TestCase):
             # New reading after the cooldown elapses: fires again.
             keeper._try_compact(now + timedelta(minutes=40), None)
             self.assertEqual(len(sender.sent), 2)
+
+    def test_overflow_error_relieves_without_waiting_for_a_lull(self):
+        # The deadlock of 2026-10-17: wedged at "Prompt is too long", so waiting
+        # for a quiet moment or for a changed reading helps nobody.
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            path = write_transcript(tx, input_tokens=95000)
+            append_entries(path, api_error("Prompt is too long"))
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            # 瓷瓷 spoke one minute ago: the soft path would hold, overflow must not.
+            now = datetime(2026, 10, 17, 11, 45, tzinfo=UTC)
+            keeper._try_compact(now, now - timedelta(minutes=1))
+            self.assertEqual(len(sender.sent), 1)
+
+    def test_overflow_overrides_a_frozen_reading(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            path = write_transcript(tx, input_tokens=95000)
+            append_entries(path, api_error("Prompt is too long"))
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            now = datetime(2026, 10, 17, 11, 45, tzinfo=UTC)
+            keeper.state["last_compact_tokens"] = 95000  # same count as the reading
+            keeper._try_compact(now, None)
+            self.assertEqual(len(sender.sent), 1)
+
+    def test_expired_login_notifies_once_and_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            path = write_transcript(tx, input_tokens=95000)  # 95%, above hard
+            append_entries(path, api_error("Login expired · Please run /login"))
+            sender = FakeSender()
+            relay = FakeRelay([])
+            keeper = MODULE.Timekeeper(
+                self.config(Path(state), Path(tx)), relay=relay, sender=sender
+            )
+            now = datetime(2026, 10, 17, 4, 55, tzinfo=UTC)
+            keeper._try_compact(now, None)
+            keeper._try_compact(now + timedelta(minutes=30), None)
+            self.assertEqual(sender.sent, [])  # a restart could hit the login prompt
+            self.assertEqual(len(relay.sent), 1)  # and 瓷瓷 hears about it once
+            self.assertIn("/login", relay.sent[0])
+            # ...and again only after the notice window has passed
+            keeper._try_compact(now + timedelta(hours=7), None)
+            self.assertEqual(len(relay.sent), 2)
+
+    def test_a_frozen_reading_stops_blocking_relief_after_the_guard_window(self):
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=90000)
+            now = datetime(2026, 8, 25, 13, 0, tzinfo=UTC)
+            sender = FakeSender()
+            keeper = self.keeper(Path(state), Path(tx), sender)
+            keeper._try_compact(now, None)
+            self.assertEqual(len(sender.sent), 1)
+            # Reading never moves. Inside the guard window that means "already
+            # relieved"; well past it, it means the ruler is stuck and relief
+            # must not stay disabled forever.
+            keeper._try_compact(now + timedelta(minutes=45), None)
+            self.assertEqual(len(sender.sent), 1)
+            keeper._try_compact(now + timedelta(minutes=75), None)
+            self.assertEqual(len(sender.sent), 2)
+
+    def test_relay_outage_does_not_skip_the_context_check(self):
+        class BrokenRelay(FakeRelay):
+            def messages_since(self, cursor):
+                raise OSError("relay unreachable")
+
+        with tempfile.TemporaryDirectory() as state, tempfile.TemporaryDirectory() as tx:
+            write_transcript(tx, input_tokens=95000)  # above hard
+            sender = FakeSender()
+            keeper = MODULE.Timekeeper(
+                self.config(Path(state), Path(tx)), relay=BrokenRelay([]), sender=sender
+            )
+            keeper.run_once(datetime(2026, 10, 17, 11, 45, tzinfo=UTC))  # must not raise
+            self.assertEqual(len(sender.sent), 1)
 
     def test_send_failure_is_reserved_not_retried_in_a_loop(self):
         class BrokenSender(FakeSender):

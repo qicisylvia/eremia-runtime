@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -175,6 +176,9 @@ class Config:
     compact_hard_percent: float = 88.0
     compact_min_idle_minutes: int = 20
     compact_cooldown_minutes: int = 30
+    # Above this, a generating turn stops being a reason to wait: the turn is
+    # about to fail on context length anyway.
+    compact_ceiling_percent: float = 94.0
     context_window_tokens: int = 200_000
     transcript_dir: Path = Path("/data/home/.claude/projects/-data-home-eremia-home")
     tmux_session: str = "eremia"
@@ -187,6 +191,8 @@ class Config:
     carryover_tail_events: int = 14
     carryover_max_event_chars: int = 3_600
     carryover_verify_minutes: int = 10
+    # How often 瓷瓷 may be told the container needs a fresh /login.
+    auth_notice_hours: float = 6.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -214,6 +220,9 @@ class Config:
         compact_hard = env_float("TIMEKEEPER_COMPACT_HARD_PERCENT", 88, 10, 100)
         if compact_hard < compact_soft:
             raise ValueError("compact hard percent must be >= soft percent")
+        compact_ceiling = env_float("TIMEKEEPER_COMPACT_CEILING_PERCENT", 94, 10, 100)
+        if compact_ceiling < compact_hard:
+            raise ValueError("compact ceiling percent must be >= hard percent")
         strategy = os.environ.get("TIMEKEEPER_CONTEXT_STRATEGY", "compact").strip().lower()
         if strategy not in {"compact", "carryover"}:
             raise ValueError("TIMEKEEPER_CONTEXT_STRATEGY must be 'compact' or 'carryover'")
@@ -245,6 +254,7 @@ class Config:
             compact_hard_percent=compact_hard,
             compact_min_idle_minutes=env_int("TIMEKEEPER_COMPACT_MIN_IDLE_MINUTES", 20, 0, 1440),
             compact_cooldown_minutes=env_int("TIMEKEEPER_COMPACT_COOLDOWN_MINUTES", 30, 1, 1440),
+            compact_ceiling_percent=compact_ceiling,
             context_window_tokens=env_int(
                 "EREMIA_CONTEXT_WINDOW_TOKENS", 200_000, 10_000, 5_000_000
             ),
@@ -261,6 +271,7 @@ class Config:
                 "EREMIA_CARRYOVER_MAX_EVENT_CHARS", 3_600, 500, 40_000
             ),
             carryover_verify_minutes=env_int("EREMIA_CARRYOVER_VERIFY_MINUTES", 10, 2, 120),
+            auth_notice_hours=env_float("TIMEKEEPER_AUTH_NOTICE_HOURS", 6, 0.5, 72),
         )
 
 
@@ -275,6 +286,8 @@ def default_state() -> dict[str, Any]:
         "night_last_date": None,
         "last_compact_ts": None,
         "last_compact_tokens": 0,
+        # Last time 瓷瓷 was told Eremia needs /login (rate-limits the notice).
+        "last_auth_notice_ts": None,
         # Carryover strategy bookkeeping (unused under the default compact strategy).
         "last_good_session": None,
         "carryover_pending": None,
@@ -366,16 +379,47 @@ def _usage_from_entry(entry: object) -> dict[str, Any] | None:
     return None
 
 
-def latest_context_tokens(transcript_dir: Path | str) -> int | None:
-    """Return the input-side token count of the newest Claude Code turn.
+# Claude Code writes a failed turn as an assistant entry with isApiErrorMessage
+# and a usage block whose fields are all zero. refined_carryover writes the same
+# all-zero shape (ZERO_USAGE) into every event of a refined transcript. Reading
+# either one as "the window is nearly empty" is what silently disabled context
+# relief on 2026-10-17: a "Login expired" turn blinded the ruler for seven hours,
+# then a "Prompt is too long" turn pinned it at 0% for good -- so the one thing
+# that could have rescued the session was switched off by the very failure it
+# exists to prevent. A zero reading is therefore *no* reading: keep walking back
+# for a real one, and report what the failed tail says separately.
+OVERFLOW_ERROR_RE = re.compile(
+    r"prompt is too long|context (?:length|window)|too many tokens|maximum context",
+    re.IGNORECASE,
+)
+AUTH_ERROR_RE = re.compile(
+    r"login expired|/login|invalid api key|unauthorized|authentication",
+    re.IGNORECASE,
+)
+# Transcripts grow for the life of a session, so never read one whole: the tail
+# holds every reading we could want, and a bounded read keeps each poll cheap
+# however long Eremia has been awake.
+TAIL_BYTES = 8 * 1024 * 1024
+TAIL_LINES = 5_000
 
-    Claude Code writes one JSONL transcript per session under the project
-    directory; each assistant turn carries a ``usage`` block. The size of the
-    context going into a request is ``input + cache_read + cache_creation``
-    tokens, so the most recent such entry tells us how full the window is right
-    now. Returns None when no transcript or usage is available (fail-quiet: the
-    watcher simply does nothing until a real reading exists).
+
+@dataclass(frozen=True)
+class ContextReading:
+    """How full the window is, plus what the turns *after* that reading say.
+
+    ``tokens`` is the input side of the newest genuinely priced turn, or None
+    when the transcript has no usable reading at all. ``overflow`` and
+    ``auth_expired`` describe failed turns newer than that reading, which is
+    exactly the information a bare token count cannot carry.
     """
+
+    tokens: int | None = None
+    session_id: str | None = None
+    overflow: bool = False
+    auth_expired: bool = False
+
+
+def active_transcript(transcript_dir: Path | str) -> Path | None:
     directory = Path(transcript_dir)
     try:
         files = [path for path in directory.glob("*.jsonl") if path.is_file()]
@@ -383,12 +427,67 @@ def latest_context_tokens(transcript_dir: Path | str) -> int | None:
         return None
     if not files:
         return None
-    newest = max(files, key=lambda path: path.stat().st_mtime)
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+def tail_text(path: Path, max_bytes: int = TAIL_BYTES) -> str:
+    """Return at most the last ``max_bytes`` of a file, minus a partial first line."""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        start = max(0, handle.tell() - max_bytes)
+        handle.seek(start)
+        chunk = handle.read()
+    text = chunk.decode("utf-8", errors="ignore")
+    if start > 0:
+        _, _, text = text.partition("\n")
+    return text
+
+
+def entry_text(entry: dict[str, Any]) -> str:
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    return ""
+
+
+def input_side_tokens(usage: dict[str, Any]) -> int:
+    """Context going into a request: fresh input + both cache sides."""
+    total = 0
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+
+def read_context(transcript_dir: Path | str) -> ContextReading:
+    """Measure the live window from the newest *priced* turn of the newest session.
+
+    Walks the transcript tail backwards, skipping anything that cannot be a
+    measurement -- subagent (sidechain) turns, meta entries, failed turns, and
+    all-zero usage blocks -- and reports any overflow/auth failure seen on the
+    way, i.e. strictly newer than the reading it returns. Fail-quiet: a missing
+    transcript or an unreadable one yields tokens=None and the watcher does
+    nothing, now with a log line saying so.
+    """
+    newest = active_transcript(transcript_dir)
+    if newest is None:
+        return ContextReading()
+    session_id = newest.stem
     try:
-        lines = newest.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = tail_text(newest).splitlines()
     except OSError:
-        return None
-    for line in reversed(lines):
+        return ContextReading(session_id=session_id)
+    overflow = False
+    auth_expired = False
+    for line in reversed(lines[-TAIL_LINES:]):
         line = line.strip()
         if not line:
             continue
@@ -396,16 +495,39 @@ def latest_context_tokens(transcript_dir: Path | str) -> int | None:
             entry = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("isApiErrorMessage"):
+            text = entry_text(entry)
+            if OVERFLOW_ERROR_RE.search(text):
+                overflow = True
+            elif AUTH_ERROR_RE.search(text):
+                auth_expired = True
+            continue
+        if entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        if entry.get("type") != "assistant":
+            continue
         usage = _usage_from_entry(entry)
         if usage is None:
             continue
-        total = 0
-        for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
-            value = usage.get(key)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-    return None
+        total = input_side_tokens(usage)
+        if total <= 0:
+            continue  # zero usage is not a measurement
+        return ContextReading(
+            tokens=total,
+            session_id=session_id,
+            overflow=overflow,
+            auth_expired=auth_expired,
+        )
+    return ContextReading(
+        session_id=session_id, overflow=overflow, auth_expired=auth_expired
+    )
+
+
+def latest_context_tokens(transcript_dir: Path | str) -> int | None:
+    """Input-side token count of the newest priced turn, or None if unknown."""
+    return read_context(transcript_dir).tokens
 
 
 class TmuxSender:
@@ -488,6 +610,8 @@ class Timekeeper:
         self.state_file = config.state_dir / "state.json"
         self.state = self._load_state()
         self._lock_handle: Any | None = None
+        # Last context-relief decline reason, so a quiet tick logs once, not forever.
+        self._last_decision: str | None = None
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -656,43 +780,99 @@ class Timekeeper:
         # A carryover swap is mid-flight (session restarting); don't stack
         # another relief action on top — the verify step will resolve it.
         if self.state.get("carryover_pending"):
+            self._note_decision("a carryover swap is in flight")
             return
-        tokens = latest_context_tokens(self.config.transcript_dir)
+        reading = read_context(self.config.transcript_dir)
+
+        # An expired login is not a context problem. Refining cannot fix it, and
+        # restarting into it could land on the /login prompt with nobody there to
+        # answer, so leave the session alone and tell 瓷瓷 instead. On 2026-10-17
+        # an expired login left Eremia unable to answer for seven hours and
+        # nothing said so; 瓷瓷 found out through prism.
+        if reading.auth_expired:
+            self._note_decision("login expired: context untouched until /login")
+            self._notify_auth_expired(now)
+            return
+
+        tokens = reading.tokens
         if tokens is None:
+            self._note_decision("no usable token reading in the transcript tail")
             return
         window = self.config.context_window_tokens
         percent = (tokens / window * 100) if window > 0 else 0.0
-        if percent < self.config.compact_soft_percent:
-            return
-        # A high reading with the exact token count we last compacted at means no
-        # new model turn has happened since; the drop just hasn't been recorded
-        # yet. Don't compact an already-compacted context.
-        if tokens == int(self.state.get("last_compact_tokens") or 0):
-            return
+
+        if reading.overflow:
+            # A context-length error means the window is already full, whatever
+            # the last priced turn measured: every new turn now fails until the
+            # context is relieved. That overrides the lull gate and the
+            # stale-reading guard — Eremia is wedged, waiting helps nobody.
+            hard = True
+            log(
+                "WARN",
+                f"context overflow error at the tail (last reading {tokens} tokens, "
+                f"{percent:.0f}%): relieving now",
+            )
+        else:
+            if percent < self.config.compact_soft_percent:
+                self._note_decision(
+                    f"{percent:.0f}% of {window} ({tokens} tokens), below the "
+                    f"{self.config.compact_soft_percent:.0f}% soft line"
+                )
+                return
+            # A high reading with the exact token count we last relieved at means
+            # no new model turn has happened since; the drop just hasn't been
+            # recorded yet. Time-bounded: a reading frozen for longer than that is
+            # a broken ruler, not a fresh compaction, and must not gate relief
+            # forever.
+            if tokens == int(self.state.get("last_compact_tokens") or 0) and not (
+                self._stale_guard_expired(now)
+            ):
+                self._note_decision(f"reading unchanged since last relief ({tokens} tokens)")
+                return
+            hard = percent >= self.config.compact_hard_percent
+
         last_compact = parse_instant(self.state.get("last_compact_ts"))
         if last_compact is not None and now - last_compact < timedelta(
             minutes=self.config.compact_cooldown_minutes
         ):
+            self._note_decision(f"{percent:.0f}% but still inside the relief cooldown")
             return
 
-        hard = percent >= self.config.compact_hard_percent
         if not hard:
             if last_human is None:
+                self._note_decision(f"{percent:.0f}%: waiting for a lull (no human message yet)")
                 return
             idle_minutes = (now - last_human).total_seconds() / 60
             if idle_minutes < self.config.compact_min_idle_minutes:
+                self._note_decision(
+                    f"{percent:.0f}%: waiting for a lull (瓷瓷 active {idle_minutes:.0f}m ago)"
+                )
                 return
 
-        # Never cut into a turn that is actively generating.
+        # Never cut into a turn that is actively generating -- until the window is
+        # so full that the turn is doomed anyway. Deferring politely has no upper
+        # bound otherwise, and on 2026-10-17 it deferred every five minutes from
+        # 97% straight into "Prompt is too long": 瓷瓷 and Eremia were talking, so
+        # something was always generating, and the one gate meant to protect a
+        # reply ended up costing her the whole session.
         if self.sender.is_busy() is True:
-            log("INFO", f"compaction deferred at {percent:.0f}%: session is generating")
-            return
+            at_ceiling = reading.overflow or percent >= self.config.compact_ceiling_percent
+            if not at_ceiling:
+                log("INFO", f"compaction deferred at {percent:.0f}%: session is generating")
+                return
+            log(
+                "WARN",
+                f"relieving at {percent:.0f}% despite a generating turn: at or past the "
+                f"{self.config.compact_ceiling_percent:.0f}% ceiling, where waiting costs "
+                "the session rather than one reply",
+            )
 
         # Reserve before acting so a failure cannot retry until the cooldown
         # elapses and the context has genuinely moved on.
         self.state["last_compact_ts"] = instant_text(now)
         self.state["last_compact_tokens"] = tokens
         self._save_state()
+        self._last_decision = None
 
         if self._carryover_active():
             if self._deliver_carryover(now, tokens, percent, hard):
@@ -702,6 +882,39 @@ class Timekeeper:
             # model-level auto-compaction fires.
             log("INFO", "carryover unavailable this cycle; falling back to /compact")
         self._deliver_compact(now, tokens, percent, hard)
+
+    def _note_decision(self, reason: str) -> None:
+        """Log why this tick left the context alone — once per distinct reason.
+
+        Every decline used to be silent, which is why a dead ruler went unnoticed
+        for three days. Deduplicated so an idle session doesn't fill the log.
+        """
+        if reason == self._last_decision:
+            return
+        self._last_decision = reason
+        log("INFO", f"context relief idle: {reason}")
+
+    def _stale_guard_expired(self, now: datetime) -> bool:
+        """True once a frozen reading can no longer be a just-relieved context."""
+        last = parse_instant(self.state.get("last_compact_ts"))
+        if last is None:
+            return True
+        return now - last >= timedelta(minutes=2 * self.config.compact_cooldown_minutes)
+
+    def _notify_auth_expired(self, now: datetime) -> None:
+        """Tell 瓷瓷 the container needs a fresh /login, at most once per window."""
+        last = parse_instant(self.state.get("last_auth_notice_ts"))
+        if last is not None and now - last < timedelta(hours=self.config.auth_notice_hours):
+            return
+        self.state["last_auth_notice_ts"] = instant_text(now)
+        self._save_state()
+        try:
+            self.relay.send_wake(
+                "[系统] Eremia 的登录过期了（Login expired），容器里要跑一次 /login "
+                "她才能继续说话。在这之前上下文精炼会停手，免得重启撞在登录框上。"
+            )
+        except Exception as exc:
+            log("ERROR", f"auth notice failed: {type(exc).__name__}: {exc}")
 
     def _deliver_compact(self, now: datetime, tokens: int, percent: float, hard: bool) -> None:
         local_now = now.astimezone(self.config.local_tz)
@@ -872,7 +1085,16 @@ class Timekeeper:
 
     def run_once(self, now: datetime | None = None) -> None:
         current = (now or datetime.now(UTC)).astimezone(UTC)
-        self._sync_history()
+        # Context relief must not depend on the relay being healthy. It reads the
+        # transcript on disk and types into tmux; the relay is only how the wake
+        # paths talk to 瓷瓷. Before, a single failed history call aborted the
+        # whole tick, so a flaky relay quietly cost whole context checks.
+        history_fresh = True
+        try:
+            self._sync_history()
+        except Exception as exc:
+            history_fresh = False
+            log("ERROR", f"relay history sync failed: {type(exc).__name__}: {exc}")
         self._save_state()
         last_human = self._last_human()
         # Resolve any in-flight carryover swap first (verify it took, or roll
@@ -882,7 +1104,9 @@ class Timekeeper:
         # Compaction can be due even before the first human message (context
         # fills from wake activity too), so check it before the early return.
         self._try_compact(current, last_human)
-        if last_human is None:
+        if not history_fresh or last_human is None:
+            # The wake paths key off how long 瓷瓷 has been quiet, which a stale
+            # history would misreport; they wait for the next good sync.
             return
         self._try_night(current, last_human)
         self._try_checkin(current, last_human)
@@ -1059,10 +1283,17 @@ def main() -> int:
                     "/data/home/.claude/projects/-data-home-eremia-home",
                 )
             )
-            tokens = latest_context_tokens(transcript_dir)
-            if tokens is None:
-                return 3  # no usable reading; caller should just resume normally
-            print(tokens)
+            # Only the number goes to stdout: entrypoint captures it.
+            reading = read_context(transcript_dir)
+            if reading.tokens is None:
+                if not reading.overflow:
+                    return 3  # no usable reading; caller should just resume normally
+                # A context-length error with no priced turn behind it still means
+                # the window is full; report it as full so the pre-flight refines
+                # instead of resuming straight back into a wedged session.
+                print(int(os.environ.get("EREMIA_MODEL_WINDOW_TOKENS") or 200_000))
+                return 0
+            print(reading.tokens)
             return 0
         config = Config.from_env()
         keeper = Timekeeper(config)

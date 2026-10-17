@@ -16,6 +16,9 @@ RUN git init /opt/tidal-echo \
 COPY eremia-web/ /opt/eremia-web/
 RUN python /opt/eremia-web/customize.py /opt/tidal-echo/web
 
+# 语音边车：纯标准库，不往上游固定的 Python 环境里加依赖。
+COPY tts/ /opt/tts/
+
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY start.sh /start.sh
 RUN chmod +x /start.sh

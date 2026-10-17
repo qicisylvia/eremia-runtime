@@ -22,5 +22,15 @@ python -m uvicorn "$MODULE" \
   --app-dir /opt/tidal-echo/backend \
   --host 127.0.0.1 --port 3011 &
 
+# 语音边车：Eremia 的声音。没配 ELEVENLABS_* 也照样起得来（/tts/speak 回 503），
+# 所以它永远不会成为 relay 起不来的原因。崩了就 5 秒后拉起来。
+(
+  while true; do
+    python /opt/tts/tts_service.py || true
+    echo "[start] tts side-car exited, restarting in 5s"
+    sleep 5
+  done
+) &
+
 # 前端已在镜像构建时由仓库内 eremia-web 覆盖层完成定制。
 exec nginx -g 'daemon off;'
